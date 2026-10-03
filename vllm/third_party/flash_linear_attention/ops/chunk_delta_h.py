@@ -14,11 +14,44 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp, exp2
-from .utils import FLA_CHUNK_SIZE, use_cuda_graph
+from .utils import (
+    FLA_CHUNK_SIZE,
+    TURING_AUTOTUNE,
+    TURING_NUM_STAGES,
+    _elem_size,
+    turing_smem_prune,
+    use_cuda_graph,
+)
 
 NUM_WARPS = [2, 4, 8, 16]
 # Triton's AMD backend fails to lower this kernel with num_stages=4.
 _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
+
+
+def _chunk_delta_h_smem(config: dict, args: dict) -> int:
+    # One recurrence step stages w [BT, 64], k [64, BT], the transposed state
+    # operand [64, BV] and the new value b_v [BT, BV], all in the k dtype.
+    elem = _elem_size(args, "k")
+    BT, BV = args["BT"], config["BV"]
+    return (2 * BT * 64 + 64 * BV + BT * BV) * elem
+
+
+if TURING_AUTOTUNE:
+    _CHUNK_DELTA_H_CONFIGS = [
+        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4, 8]
+        for num_stages in TURING_NUM_STAGES
+        for BV in [16, 32, 64]
+    ]
+    _CHUNK_DELTA_H_PRUNE = turing_smem_prune(_chunk_delta_h_smem)
+else:
+    _CHUNK_DELTA_H_CONFIGS = [
+        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4]
+        for num_stages in _CHUNK_DELTA_H_NUM_STAGES
+        for BV in [32, 64]
+    ]
+    _CHUNK_DELTA_H_PRUNE = None
 
 
 @triton.heuristics(
@@ -32,13 +65,9 @@ _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in _CHUNK_DELTA_H_NUM_STAGES
-        for BV in [32, 64]
-    ],
+    configs=_CHUNK_DELTA_H_CONFIGS,
     key=["H", "K", "V", "BT"],
+    prune_configs_by=_CHUNK_DELTA_H_PRUNE,
     use_cuda_graph=use_cuda_graph,
 )
 @triton.jit(do_not_specialize=["T"])

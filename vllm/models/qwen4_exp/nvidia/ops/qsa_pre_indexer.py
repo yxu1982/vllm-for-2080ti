@@ -263,9 +263,13 @@ def _qsa_pre_indexer_kernel(
                 mask=valid & source_valid[:, None],
                 other=0.0,
             ).to(tl.float32)
-            # Match the unfused path's BF16 pooled tensor before RMSNorm.
+            # Match the unfused path's pooled tensor (rounded to the K storage
+            # dtype) before RMSNorm. Deriving the dtype from the pointer keeps
+            # the kernel compilable on GPUs without bf16 conversions (sm75).
             pooled = (
-                (tl.sum(source, axis=0) / COMPRESS_RATIO).to(tl.bfloat16).to(tl.float32)
+                (tl.sum(source, axis=0) / COMPRESS_RATIO)
+                .to(k_ptr.dtype.element_ty)
+                .to(tl.float32)
             )
 
             first_position = end_position - (COMPRESS_RATIO - 1)

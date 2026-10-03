@@ -14,16 +14,37 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
+from .utils import TURING_AUTOTUNE, TURING_NUM_STAGES, _elem_size, turing_smem_prune
+
+
+def _wy_smem(config: dict, args: dict) -> int:
+    # A [BT, BT] plus the larger of the v [BT, BV] / k [BT, BK] loop operands.
+    elem = _elem_size(args, "k")
+    BT = args["BT"]
+    return (BT * BT + BT * max(args["BV"], args["BK"])) * elem
+
+
+if TURING_AUTOTUNE:
+    _WY_CONFIGS = [
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [1, 2, 4, 8]
+        for num_stages in TURING_NUM_STAGES
+    ]
+    _WY_PRUNE = turing_smem_prune(_wy_smem)
+else:
+    _WY_CONFIGS = [
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ]
+    _WY_PRUNE = None
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=_WY_CONFIGS,
     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
+    prune_configs_by=_WY_PRUNE,
 )
 @triton.jit(do_not_specialize=["T"])
 def recompute_w_u_fwd_kernel(

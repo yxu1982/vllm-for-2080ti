@@ -817,6 +817,29 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+def _drop_checkpoint_file_cache(path: str) -> None:
+    """Return a fully-consumed checkpoint shard's page cache to the kernel.
+
+    With pinned CPU-offload tables (e.g. the Qwen4Exp PLE n-gram embedding,
+    ~100 GiB) resident in host RAM, the kernel's page cache for the
+    safetensors shards can push the peak past physical memory. Dropping each
+    shard's cache right after it is read bounds the peak to the pinned table
+    plus a constant number of in-flight files.
+    """
+    if not hasattr(os, "posix_fadvise"):
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -902,17 +925,74 @@ def safetensors_weights_iterator(
             block_size=safetensors_prefetch_block_size,
         )
 
+    _drop_env = os.environ.get("VLLM_DROP_CHECKPOINT_CACHE", "auto").strip().lower()
+    # When the PLE mmap overlay is active, the n-gram shards are served by the
+    # mmap table (built in load_weights); skip reading them here to avoid
+    # re-streaming ~100 GiB per rank.
+    _skip_ple_shard = (
+        os.environ.get("VLLM_PLE_MMAP_MODE", "").strip().lower()
+        in ("mem", "memory", "ram", "cpu", "disk", "mmap", "nvme")
+        or os.environ.get("VLLM_PLE_MMAP", "").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    if _drop_env in ("0", "false", "no", "off"):
+        drop_shard_cache = False
+    elif _drop_env in ("1", "true", "yes", "on"):
+        drop_shard_cache = True
+    else:
+        _total_gib = total_bytes / 1024**3
+        _avail_gib = avail_bytes / 1024**3
+        drop_shard_cache = _total_gib > 0.6 * _avail_gib
+    if drop_shard_cache:
+        logger.info_once(
+            "Host memory is tight (checkpoint %.2f GiB, available RAM %.2f GiB): "
+            "dropping each shard's page cache after it is read. "
+            "Set VLLM_DROP_CHECKPOINT_CACHE=0 to disable.",
+            total_bytes / 1024**3,
+            avail_bytes / 1024**3,
+        )
+
+    _defer_env = os.environ.get("VLLM_DEFER_ENGRAM_LOAD", "auto").strip().lower()
+    if safetensors_load_strategy == "torchao":
+        # torchao subclass reconstruction needs every piece of a tensor in one
+        # pass; do not split it across the two phases.
+        defer_engram = False
+    elif _defer_env in ("0", "false", "no", "off"):
+        defer_engram = False
+    elif _defer_env in ("1", "true", "yes", "on"):
+        defer_engram = True
+    else:
+        defer_engram = total_bytes > 0.6 * avail_bytes
+    if defer_engram:
+        logger.info_once(
+            "Host memory is tight (checkpoint %.2f GiB, available RAM %.2f GiB): "
+            "loading n-gram/PLE embedding weights last so the rest of the model "
+            "reaches the GPU first. Set VLLM_DEFER_ENGRAM_LOAD=0 to disable.",
+            total_bytes / 1024**3,
+            avail_bytes / 1024**3,
+        )
+
+    def _is_engram_name(name: str) -> bool:
+        return "ngram_embedding" in name
+
     leftover_state_dict: dict[str, torch.Tensor] = {}
-    for st_file in tqdm(
-        sorted_files,
-        desc=loading_desc,
-        disable=not enable_tqdm(use_tqdm_on_load),
-        bar_format=_BAR_FORMAT,
-    ):
+
+    def _iter_file(
+        st_file: str, want_engram: bool | None
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        nonlocal leftover_state_dict
+
+        def _keep(name: str) -> bool:
+            if _skip_ple_shard and "ngram_embedding.shard_" in name:
+                return False
+            return want_engram is None or _is_engram_name(name) == want_engram
+
         if safetensors_load_strategy == "eager":
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
+                if not _keep(name):
+                    continue
                 if not should_skip_weight(name, local_expert_ids):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
@@ -932,6 +1012,8 @@ def safetensors_weights_iterator(
                 for name in f.keys():  # noqa: SIM118
                     if should_skip_weight(name, local_expert_ids):
                         continue
+                    if not _keep(name):
+                        continue
                     state_dict[name] = f.get_tensor(name)
 
                 # update with leftover tensor data from previous iteration, if any
@@ -950,8 +1032,27 @@ def safetensors_weights_iterator(
                 for name in f.keys():  # noqa: SIM118
                     if should_skip_weight(name, local_expert_ids):
                         continue
+                    if not _keep(name):
+                        continue
                     param = f.get_tensor(name)
                     yield name, param
+        if drop_shard_cache:
+            _drop_checkpoint_file_cache(st_file)
+
+    def _pass(want_engram: bool | None):
+        for st_file in tqdm(
+            sorted_files,
+            desc=loading_desc,
+            disable=not enable_tqdm(use_tqdm_on_load),
+            bar_format=_BAR_FORMAT,
+        ):
+            yield from _iter_file(st_file, want_engram)
+
+    if defer_engram:
+        yield from _pass(False)
+        yield from _pass(True)
+    else:
+        yield from _pass(None)
 
 
 def multi_thread_safetensors_weights_iterator(

@@ -184,6 +184,15 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
         ) and quant_config.is_layer_excluded(prefix):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if not isinstance(quant_config, Fp8Config):
+            # Compressed-tensors packs (e.g. AWQ W4A16) keep the PLE table
+            # unquantized; honor the pack ignore list instead of raising.
+            ct_ignore = getattr(quant_config, "ignored_layers", None)
+            if ct_ignore is None:
+                ct_ignore = getattr(quant_config, "ignore", []) or []
+            if prefix in ct_ignore or any(
+                name.startswith(f"{prefix}.shard_") for name in ct_ignore
+            ):
+                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
             raise NotImplementedError(
                 "Qwen4Exp PLE embedding does not support quantization config "
                 f"{type(quant_config).__name__}"
@@ -467,10 +476,17 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
 
         flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
+            weight_view, output_view = self._uva_weight, output
+            if self.weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                # The gather only moves bytes. Triton has no fp8e4nv type on
+                # pre-Ampere GPUs (sm75), so present the table and the
+                # destination as uint8 (same element count, 1 byte each).
+                weight_view = self._uva_weight.view(torch.uint8)
+                output_view = output.view(torch.uint8)
             _lookup_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self._uva_weight,
+                weight_view,
                 flat_ids,
-                output,
+                output_view,
                 self.embedding_dim,
                 self.shard_indices.org_vocab_start_index,
                 self.shard_indices.org_vocab_end_index,
@@ -936,3 +952,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 __all__ = [
     "Qwen4ExpNGramEmbedding",
 ]
+
+# vllm-turing overlay: PLE table offload via RAM-mmap / NVMe-mmap (idempotent).
+import vllm.vllm_ple_mmap as _vllm_ple_mmap
+
+_vllm_ple_mmap.maybe_apply(Qwen4ExpNGramEmbedding)

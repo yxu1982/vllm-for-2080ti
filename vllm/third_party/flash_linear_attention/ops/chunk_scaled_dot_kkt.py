@@ -15,7 +15,38 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
-from .utils import FLA_CHUNK_SIZE
+from .utils import (
+    FLA_CHUNK_SIZE,
+    TURING_AUTOTUNE,
+    TURING_NUM_STAGES,
+    _elem_size,
+    turing_smem_prune,
+)
+
+
+def _chunk_kkt_smem(config: dict, args: dict) -> int:
+    # Per K step: the beta-scaled k tile [BT, BK] and its transpose [BK, BT].
+    elem = _elem_size(args, "k")
+    BT, BK = args["BT"], config["BK"]
+    return 2 * BT * BK * elem
+
+
+if TURING_AUTOTUNE:
+    _CHUNK_KKT_CONFIGS = [
+        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [16, 32, 64, 128]
+        for num_warps in [2, 4, 8]
+        for num_stages in TURING_NUM_STAGES
+    ]
+    _CHUNK_KKT_PRUNE = turing_smem_prune(_chunk_kkt_smem)
+else:
+    _CHUNK_KKT_CONFIGS = [
+        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64, 128]
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ]
+    _CHUNK_KKT_PRUNE = None
 
 # On RDNA (gfx11xx/gfx12xx) WMMA only
 # accepts 16-bit/int inputs, so a widened (e.g. fp32) tl.dot is lowered to a
@@ -35,13 +66,9 @@ if current_platform.is_rocm():
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=_CHUNK_KKT_CONFIGS,
     key=["H", "K", "BT", "IS_VARLEN"],
+    prune_configs_by=_CHUNK_KKT_PRUNE,
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_scaled_dot_kkt_fwd_kernel(

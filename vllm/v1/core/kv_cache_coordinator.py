@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
 
+import os
+
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
@@ -29,6 +31,10 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# Opt-in per-request hit trace (VLLM_QWEN4_KV_HIT_DEBUG=1): reconciled hit vs
+# each KV cache group's own hit, to see which group shortens the prefix hit.
+_KV_HIT_DEBUG = os.environ.get("VLLM_QWEN4_KV_HIT_DEBUG", "0") == "1"
 
 
 def _validate_prefix_cache_retention_interval(
@@ -965,6 +971,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         cache_hit_blocks = tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         )
+        if _KV_HIT_DEBUG:
+            logger.info(
+                "kv-hit max=%d hit=%d longest=%d per_group=%s block_sizes=%s "
+                "alignment=%d hash_block=%d",
+                max_cache_hit_length,
+                hit_length,
+                longest_hit_length,
+                hit_length_by_group,
+                [m.block_size for m in self.single_type_managers],
+                self._cache_hit_alignment_tokens,
+                self.hash_block_size,
+            )
         return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens
 
     def find_longest_cache_hit_per_group(

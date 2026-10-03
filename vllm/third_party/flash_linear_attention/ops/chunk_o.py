@@ -16,10 +16,46 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
-from .utils import FLA_CHUNK_SIZE, check_shared_mem, is_nvidia_hopper
+from .utils import (
+    FLA_CHUNK_SIZE,
+    TURING_AUTOTUNE,
+    TURING_NUM_STAGES,
+    _elem_size,
+    check_shared_mem,
+    is_nvidia_hopper,
+    turing_smem_prune,
+)
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+
+
+def _chunk_o_smem(config: dict, args: dict) -> int:
+    # Per K step: q [BT, BK], k [BK, BT], h [BV, BK]; epilogue: A [BT, BT]
+    # (cast to the v dtype) and v [BT, BV].
+    elem = _elem_size(args, "q")
+    BT, BK, BV = args["BT"], config["BK"], config["BV"]
+    return (2 * BT * BK + BV * BK + BT * BT + BT * BV) * elem
+
+
+if TURING_AUTOTUNE:
+    _CHUNK_O_CONFIGS = [
+        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64]
+        for BV in [16, 32, 64]
+        for num_warps in [2, 4, 8]
+        for num_stages in TURING_NUM_STAGES
+    ]
+    _CHUNK_O_PRUNE = turing_smem_prune(_chunk_o_smem)
+else:
+    _CHUNK_O_CONFIGS = [
+        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK in BKV_LIST
+        for BV in BKV_LIST
+        for num_warps in NUM_WARPS
+        for num_stages in [2, 3, 4]
+    ]
+    _CHUNK_O_PRUNE = None
 
 
 @triton.heuristics(
@@ -29,14 +65,9 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ],
+    configs=_CHUNK_O_CONFIGS,
     key=["H", "K", "V", "BT"],
+    prune_configs_by=_CHUNK_O_PRUNE,
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(

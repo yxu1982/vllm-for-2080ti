@@ -202,9 +202,28 @@ class SchedulerConfig:
     (the default) disables the watermark."""
 
     prefill_schedule_interval: int = Field(default=1, ge=1)
-    """For data-parallel deployments, only admit new prefill requests
-    once every N engine steps, aligned across DP ranks, to better balance
-    per-step forward-pass times."""
+    """Only schedule prefill work (new admissions and in-progress chunks)
+    once every N engine steps while at least one request is decoding.
+    For data-parallel deployments the cadence is aligned across DP ranks to
+    balance per-step forward-pass times, and is lifted when the queue is
+    capacity-bound. Without DP it is a decode-protection knob: running
+    decodes get N-1 prefill-free steps per prefill step, at the cost of
+    proportionally longer prefills while decodes are active. The cadence is
+    adaptive: no decoding sequence -> no throttling; decoding with no long
+    prefill in flight -> `prefill_schedule_interval_low`; decoding while a
+    prefill with >= `prefill_schedule_long_tokens` tokens left is running ->
+    this value."""
+
+    prefill_schedule_interval_low: int = Field(default=16, ge=1)
+    """Prefill cadence used while sequences are decoding but no long prefill
+    is in flight (non-DP only; see `prefill_schedule_interval`). Set equal to
+    `prefill_schedule_interval` for a static cadence."""
+
+    prefill_schedule_long_tokens: int = Field(default=16384, ge=1)
+    """A running prefill with at least this many prompt tokens still to
+    compute counts as long: while one is in flight and something is decoding,
+    the full `prefill_schedule_interval` applies; otherwise
+    `prefill_schedule_interval_low` does."""
 
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to

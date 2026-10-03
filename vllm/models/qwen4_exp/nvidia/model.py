@@ -156,6 +156,9 @@ _EXTRA_WEIGHTS_MAPPER = WeightsMapper(
 )
 
 
+from vllm.models.qwen4_exp.nvidia import prefill_timing as _prefill_timing  # noqa: F401
+
+
 class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
     """Qwen3Next MoE with Qwen4Exp HC validation."""
 
@@ -259,7 +262,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         hc_config = HyperConnectionConfig(
             hc_count=config.hc_count,
             hidden_size=config.hidden_size,
-            params_dtype=torch.bfloat16,
+            params_dtype=model_config.dtype,
             hc_lowrank=config.hc_lowrank,
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
@@ -429,7 +432,7 @@ class Qwen4ExpModel(nn.Module):
             hc_config = HyperConnectionConfig(
                 hc_count=config.hc_count,
                 hidden_size=config.hidden_size,
-                params_dtype=torch.bfloat16,
+                params_dtype=vllm_config.model_config.dtype,
                 hc_lowrank=config.hc_lowrank,
                 rms_norm_eps=config.rms_norm_eps,
                 hc_per_branch_norm=True,
@@ -678,6 +681,7 @@ class Qwen4ExpForCausalLM(
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)

@@ -383,6 +383,83 @@ def _build_qsa_metadata_kernel(
             tl.extra.cuda.gdc_launch_dependents()
 
 
+def _launch_qsa_metadata_kernel(
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    common_slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    logical_positions: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    k_work_metadata_buffer: torch.Tensor | None,
+    *,
+    num_reqs: int,
+    num_mapped_tokens: int,
+    num_tokens: int,
+    request_capacity: int | None,
+    storage_block_size: int,
+    compress_ratio: int,
+    circular_buffer_size: int,
+) -> None:
+    """Launch the metadata kernel over caller-owned output buffers.
+
+    Every input is a device tensor the caller keeps alive or a Python int
+    fixed by the batch shape, and nothing is allocated or read back to the
+    host, so the launch is CUDA-graph capture-safe. Re-running it with the
+    same arguments rewrites the same buffers in place from the current
+    contents of ``query_start_loc``, ``seq_lens``, ``common_slot_mapping``
+    and ``block_table``.
+    """
+    assert num_reqs > 0
+    if k_work_metadata_buffer is not None:
+        if request_capacity is None:
+            request_capacity = num_reqs
+        assert request_capacity >= num_reqs
+        # Pad for tl.arange while keeping the scan width stable across live batches.
+        request_scan_size = 1 << int(math.ceil(math.log2(request_capacity)))
+        max_num_work = k_work_metadata_buffer.shape[0]
+    else:
+        request_scan_size = 1
+        max_num_work = 0
+
+    num_search_steps = int(math.ceil(math.log2(num_reqs)))
+    work_search_steps = int(math.ceil(math.log2(num_reqs)))
+    # The same grid covers token tiles and, for the compressed cache, work tiles.
+    num_token_blocks = cdiv(num_tokens, 128)
+    num_work_blocks = (
+        cdiv(max_num_work, 256) if k_work_metadata_buffer is not None else 0
+    )
+    _build_qsa_metadata_kernel[(max(num_token_blocks, num_work_blocks, 1),)](
+        query_start_loc,
+        seq_lens,
+        common_slot_mapping,
+        block_table,
+        token_to_req,
+        logical_positions,
+        visible_blocks,
+        slot_mapping,
+        k_work_metadata_buffer,
+        block_table.stride(0),
+        block_table.stride(1),
+        num_reqs,
+        num_mapped_tokens,
+        num_tokens,
+        max_num_work,
+        num_search_steps,
+        work_search_steps,
+        storage_block_size,
+        compress_ratio,
+        circular_buffer_size,
+        block_table.shape[1],
+        launch_pdl=_metadata_launch_pdl(),
+        TOKEN_BLOCK_SIZE=128,
+        REQUEST_SCAN_SIZE=request_scan_size,
+        WORK_BLOCK_SIZE=256,
+        num_warps=4,
+    )
+
+
 def build_qsa_metadata_triton(
     common_attn_metadata: CommonAttentionMetadata,
     token_to_req_buffer: torch.Tensor,
@@ -410,51 +487,27 @@ def build_qsa_metadata_triton(
         if request_capacity is None:
             request_capacity = num_reqs
         assert request_capacity >= num_reqs
-        # Pad for tl.arange while keeping the scan width stable across live batches.
-        request_scan_size = 1 << int(math.ceil(math.log2(request_capacity)))
-        max_num_work = k_work_metadata_buffer.shape[0]
-    else:
-        request_scan_size = 1
-        max_num_work = 0
 
     if num_tokens == 0 and k_work_metadata_buffer is None:
         return token_to_req, logical_positions, visible_blocks, slot_mapping
 
-    block_table = common_attn_metadata.block_table_tensor
-    num_search_steps = int(math.ceil(math.log2(num_reqs)))
-    work_search_steps = int(math.ceil(math.log2(num_reqs)))
-    # The same grid covers token tiles and, for the compressed cache, work tiles.
-    num_token_blocks = cdiv(num_tokens, 128)
-    num_work_blocks = (
-        cdiv(max_num_work, 256) if k_work_metadata_buffer is not None else 0
-    )
-    _build_qsa_metadata_kernel[(max(num_token_blocks, num_work_blocks, 1),)](
+    _launch_qsa_metadata_kernel(
         common_attn_metadata.query_start_loc,
         common_attn_metadata.seq_lens,
         common_attn_metadata.slot_mapping,
-        block_table,
+        common_attn_metadata.block_table_tensor,
         token_to_req,
         logical_positions,
         visible_blocks,
         slot_mapping,
         k_work_metadata_buffer,
-        block_table.stride(0),
-        block_table.stride(1),
-        num_reqs,
-        num_mapped_tokens,
-        num_tokens,
-        max_num_work,
-        num_search_steps,
-        work_search_steps,
-        storage_block_size,
-        compress_ratio,
-        circular_buffer_size,
-        block_table.shape[1],
-        launch_pdl=_metadata_launch_pdl(),
-        TOKEN_BLOCK_SIZE=128,
-        REQUEST_SCAN_SIZE=request_scan_size,
-        WORK_BLOCK_SIZE=256,
-        num_warps=4,
+        num_reqs=num_reqs,
+        num_mapped_tokens=num_mapped_tokens,
+        num_tokens=num_tokens,
+        request_capacity=request_capacity,
+        storage_block_size=storage_block_size,
+        compress_ratio=compress_ratio,
+        circular_buffer_size=circular_buffer_size,
     )
     if circular_buffer_size == 0 and compress_ratio == 1:
         slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
@@ -591,12 +644,23 @@ class QSAForwardMetadata(AttentionMetadata):
     max_seq_len: int
     storage_block_size: int
     compress_ratio: int
+    # Build inputs that ``update_draft_decode_metadata`` re-reads. The common
+    # slot mapping is the persistent per-group tensor the speculator rewrites
+    # between draft steps; the mapped-token count is the CPU-side
+    # ``query_start_loc_cpu[-1]`` frozen at build time (one query per request
+    # keeps it constant across draft steps).
+    common_slot_mapping: torch.Tensor | None = None
+    num_mapped_tokens: int = 0
 
 
 class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
     """Build QSA metadata from vLLM's cache-group-specific common metadata."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    # The fused multi-step draft loop refreshes this metadata in place with
+    # the Triton build kernel (see update_draft_decode_metadata). The torch
+    # fallback allocates scratch per call, so it cannot be captured.
+    supports_draft_decode_metadata_update: bool = HAS_TRITON
 
     def __init__(
         self,
@@ -692,9 +756,7 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
                 self.slot_mapping_buffer,
                 storage_block_size=self.storage_block_size,
                 compress_ratio=self.compress_ratio,
-                circular_buffer_size=(
-                    self.kv_cache_spec.block_size if self.is_circular_buffer else 0
-                ),
+                circular_buffer_size=self._circular_buffer_size(),
                 k_work_metadata_buffer=k_work_metadata if build_k_work else None,
                 request_capacity=request_capacity,
             )
@@ -718,17 +780,89 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             max_seq_len=common_attn_metadata.max_seq_len,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+            common_slot_mapping=common_attn_metadata.slot_mapping,
+            num_mapped_tokens=int(common_attn_metadata.query_start_loc_cpu[-1]),
+        )
+
+    def _circular_buffer_size(self) -> int:
+        return self.kv_cache_spec.block_size if self.is_circular_buffer else 0
+
+    def update_draft_decode_metadata(self, metadata: QSAForwardMetadata) -> None:
+        """Refresh step-dependent QSA metadata in place for the fused draft loop.
+
+        Between draft decode steps the speculator advances ``seq_lens`` and
+        ``positions`` in place and rewrites the common ``slot_mapping``
+        (``BlockTables.compute_slot_mappings``); ``query_start_loc`` and the
+        block table are unchanged because every request carries one query
+        token. Re-running the build kernel over the persistent buffers that
+        ``metadata`` already points at recomputes ``logical_positions``
+        (+1 per step), ``visible_blocks`` (the newly completed compression
+        group, if any), the side-cache ``slot_mapping`` (next ring slot, or
+        the boundary-only compressed slot), ``token_to_req`` and
+        ``k_work_metadata`` (constant for one query per request, rebuilt for
+        uniformity).
+
+        Capture-safety: only device tensors referenced by ``metadata`` and
+        Python ints frozen at build time reach the launch; nothing is
+        allocated, no host sync or ``.item()`` happens, so the launch records
+        into a full CUDA graph and replays against the same buffers.
+        """
+        if not HAS_TRITON:
+            raise NotImplementedError(
+                "QSA draft metadata refresh requires the Triton build kernel"
+            )
+        num_tokens = metadata.num_actual_tokens
+        build_k_work = not self.is_circular_buffer and self.compress_ratio != 1
+        if num_tokens == 0 and not build_k_work:
+            return
+        common_slot_mapping = metadata.common_slot_mapping
+        assert common_slot_mapping is not None, (
+            "QSA metadata was built without its common slot mapping"
+        )
+        # The kernel writes through these views, so they must be the same
+        # storage the consumers read from the metadata object. Pointer
+        # comparisons are host-side bookkeeping, not device syncs.
+        assert metadata.token_to_req.data_ptr() == self.token_to_req_buffer.data_ptr()
+        assert (
+            metadata.logical_positions.data_ptr()
+            == self.logical_positions_buffer.data_ptr()
+        )
+        assert (
+            metadata.visible_blocks.data_ptr() == self.visible_blocks_buffer.data_ptr()
+        )
+        slot_mapping = self.slot_mapping_buffer[:num_tokens]
+        if self.is_circular_buffer or self.compress_ratio != 1:
+            assert metadata.slot_mapping.data_ptr() == slot_mapping.data_ptr()
+        num_reqs = metadata.query_start_loc.shape[0] - 1
+        _launch_qsa_metadata_kernel(
+            metadata.query_start_loc,
+            metadata.seq_lens,
+            common_slot_mapping,
+            metadata.block_table,
+            metadata.token_to_req,
+            metadata.logical_positions,
+            metadata.visible_blocks,
+            slot_mapping,
+            metadata.k_work_metadata if build_k_work else None,
+            num_reqs=num_reqs,
+            num_mapped_tokens=metadata.num_mapped_tokens,
+            num_tokens=num_tokens,
+            request_capacity=self.request_capacity if build_k_work else None,
+            storage_block_size=self.storage_block_size,
+            compress_ratio=self.compress_ratio,
+            circular_buffer_size=self._circular_buffer_size(),
         )
 
 
 class QSAStateBackend(AttentionBackend):
     """Key-only dummy backend for out-of-band QSA side-cache operations."""
 
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
     # fp8 entries allow the optional e4m3 compressed indexer cache.
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "bfloat16",
+        "float16",
         "fp8",
         "fp8_e4m3",
     ]

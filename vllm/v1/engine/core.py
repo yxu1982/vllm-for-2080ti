@@ -626,8 +626,11 @@ class EngineCore:
             eco.scheduler_stats.iteration_details = iteration_details
 
     def _should_throttle_prefills(self) -> bool:
-        """Whether to defer new prefills this step (DP prefill balancing).
-        Overridden by the DP engine core; never throttles otherwise."""
+        """Whether to defer prefill work this step (DP prefill balancing).
+
+        The DP engine core overrides this with a wave-aligned counter shared
+        across ranks. Without DP the scheduler applies its own adaptive
+        `prefill_schedule_interval` cadence, so nothing is requested here."""
         return False
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:

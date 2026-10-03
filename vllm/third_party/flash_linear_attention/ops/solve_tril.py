@@ -16,7 +16,13 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import make_tensor_descriptor
-from .utils import input_guard, is_amd, is_tma_supported
+from .utils import (
+    TURING_AUTOTUNE,
+    TURING_NUM_STAGES,
+    input_guard,
+    is_amd,
+    is_tma_supported,
+)
 
 FLA_TRIL_PRECISION = os.environ.get("FLA_TRIL_PRECISION", "ieee")
 ALLOWED_TRIL_PRECISIONS = ["ieee", "tf32"] if is_amd else ["ieee", "tf32", "tf32x3"]
@@ -25,12 +31,17 @@ assert FLA_TRIL_PRECISION in ALLOWED_TRIL_PRECISIONS, (
 )
 
 
+# 16x16 / 32x32 / 64x64 fp32 tiles: KiB-scale shared memory on every arch, so
+# the Turing lists only collapse num_stages (see utils.TURING_NUM_STAGES).
+_TRIL_NUM_STAGES = TURING_NUM_STAGES if TURING_AUTOTUNE else [2, 3, 4, 5]
+
+
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
+        for num_stages in _TRIL_NUM_STAGES
     ],
     key=["BT"],
 )
@@ -105,7 +116,7 @@ def solve_tril_16x16_kernel(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
+        for num_stages in _TRIL_NUM_STAGES
     ],
     key=["H", "BT", "IS_VARLEN"],
 )
@@ -230,7 +241,7 @@ def merge_16x16_to_32x32_inverse_kernel(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
+        for num_stages in _TRIL_NUM_STAGES
     ],
     key=["H", "BT", "IS_VARLEN"],
 )

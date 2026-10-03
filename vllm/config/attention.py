@@ -10,7 +10,7 @@ from vllm.config.utils import config
 from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-IndexerKVDType = Literal["auto", "bf16", "fp8", "mxfp4", "nvfp4"]
+IndexerKVDType = Literal["auto", "bf16", "fp16", "fp8", "mxfp4", "nvfp4"]
 MiniMaxM3MSADecodeBackend = Literal["triton", "cutlass"]
 
 

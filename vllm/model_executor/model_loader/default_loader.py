@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import glob
+import json
 import os
 import time
 from collections.abc import Generator, Iterable
@@ -313,10 +314,67 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config.pt_load_map_location,
                 )
 
+        if use_safetensors:
+            weights_iterator = self._filter_unindexed_safetensors(
+                hf_folder, weights_iterator
+            )
+
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+
+    @staticmethod
+    def _filter_unindexed_safetensors(
+        hf_folder: str,
+        weights_iterator: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Reject (or, opted in, skip) tensors model.safetensors.index.json omits.
+
+        A shard referenced by the index may also carry tensors that belong to a
+        different checkpoint, e.g. a quantized repo that reuses complete
+        embedding shards from an FP8 release. Such tensors would otherwise
+        reach the model's weight loader and fail on shape/dtype. Strict by
+        default: raise naming the first offenders and the fix (repack the
+        checkpoint so every shard holds only indexed tensors). Set
+        VLLM_SKIP_UNINDEXED_SAFETENSORS=1 to load the indexed tensors and skip
+        the rest with a warning instead, as transformers does.
+        """
+        index_file = os.path.join(hf_folder, SAFE_WEIGHTS_INDEX_NAME)
+        if not os.path.isfile(index_file):
+            return weights_iterator
+        with open(index_file) as f:
+            weight_map = json.load(f).get("weight_map") or {}
+        if not weight_map:
+            return weights_iterator
+
+        skip_unindexed = os.environ.get("VLLM_SKIP_UNINDEXED_SAFETENSORS") == "1"
+
+        def filtered() -> Generator[tuple[str, torch.Tensor], None, None]:
+            skipped: list[str] = []
+            for name, tensor in weights_iterator:
+                if name in weight_map:
+                    yield name, tensor
+                    continue
+                if not skip_unindexed:
+                    raise ValueError(
+                        f"Checkpoint shard carries tensor {name!r} that "
+                        f"{SAFE_WEIGHTS_INDEX_NAME} does not list. Repack the "
+                        "checkpoint so each shard holds only indexed tensors, "
+                        "or set VLLM_SKIP_UNINDEXED_SAFETENSORS=1 to skip such "
+                        "tensors."
+                    )
+                skipped.append(name)
+            if skipped:
+                logger.warning(
+                    "Skipped %d safetensors tensor(s) not listed in %s "
+                    "(VLLM_SKIP_UNINDEXED_SAFETENSORS=1), e.g. %s",
+                    len(skipped),
+                    SAFE_WEIGHTS_INDEX_NAME,
+                    skipped[:3],
+                )
+
+        return filtered()
 
     def get_all_weights(
         self,

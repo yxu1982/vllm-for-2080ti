@@ -669,7 +669,17 @@ class RoutedExperts(PluggableLayer):
             )
             and is_transposed
         ):
-            loaded_weight = loaded_weight.t().contiguous()
+            # A checkpoint converted with the expert tensors already stored in
+            # the transposed (Marlin) layout declares
+            # quantization_config.ct_expert_pretransposed = true; then the
+            # per-tensor transpose+copy on load is skipped (loader speed).
+            pretransposed = bool(
+                getattr(getattr(self, "quant_config", None), "config", {}).get(
+                    "ct_expert_pretransposed", False
+                )
+            )
+            if not pretransposed:
+                loaded_weight = loaded_weight.t().contiguous()
 
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")

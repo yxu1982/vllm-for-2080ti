@@ -33,12 +33,18 @@ class Qwen4ExpModelState(MambaHybridModelState):
             return
 
         if vllm_config.parallel_config.pipeline_parallel_size > 1:
-            raise RuntimeError(
-                "N-gram PLE embedding currently requires "
-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
-                "not receive the raw input_ids required by PLE. Please run "
-                "with PP=1."
-            )
+            # Allow PP>1 when every PLE layer is on pipeline rank 0 (the only
+            # rank that receives raw input_ids); reject otherwise.
+            _pp = vllm_config.parallel_config.pipeline_parallel_size
+            _rank0_layers = config.num_hidden_layers // _pp
+            _stray = [i for i in config.ple_layer_ids if i > _rank0_layers]
+            if _stray:
+                raise RuntimeError(
+                    "N-gram PLE embedding requires the PLE layers on pipeline "
+                    "rank 0 (the only rank receiving raw input_ids). PLE "
+                    f"layer(s) not on rank 0: {_stray}. Use PP=1 or a PP size "
+                    "that keeps the PLE layers in the first stage."
+                )
 
         self.ngram_context_len = int(config.ngram_size) - 1
         if self.ngram_context_len <= 0:

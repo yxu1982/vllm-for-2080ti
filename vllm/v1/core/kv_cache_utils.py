@@ -1779,8 +1779,17 @@ def get_kv_cache_config_from_groups(
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
-            for layer_name, spec in group_spec.kv_cache_specs.items():
-                layers_by_spec[spec].append(layer_name)
+            # sm75 overlay: under PP, a group's layers may all live on another
+            # pipeline rank (MTP draft head / single-rank PLE layer). The worker
+            # projection keeps the full global kv_cache_specs dict when this
+            # worker's slice is empty, so using its keys would emit "ghost"
+            # layer names -> allocate_kv_cache's next(...) is empty ->
+            # StopIteration. Use the (correctly projected) group.layer_names
+            # instead, which is a subset of the spec keys.
+            for layer_name in group.layer_names:
+                spec = group_spec.kv_cache_specs.get(layer_name)
+                if spec is not None:
+                    layers_by_spec[spec].append(layer_name)
         elif group.layer_names:
             layers_by_spec[group_spec].extend(group.layer_names)
 

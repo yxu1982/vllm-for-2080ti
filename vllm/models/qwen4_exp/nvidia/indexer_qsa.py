@@ -107,8 +107,8 @@ class QSAIndexer(nn.Module):
         super().__init__()
         if vllm_config.cache_config is None:
             raise ValueError("QSA requires a paged KV cache")
-        if vllm_config.model_config.dtype != torch.bfloat16:
-            raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
+        if vllm_config.model_config.dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError("Qwen4Exp QSA requires BF16 or FP16")
 
         self.layer_id = int(layer_id)
         self.index_n_heads = int(config.indexer_n_heads)
@@ -148,22 +148,28 @@ class QSAIndexer(nn.Module):
         cache_prefix = f"{prefix}." if prefix else ""
         # Plain e4m3 without scales: Q and the compressed K are RMSNormed
         # before quantization, and the logits kernels dot fp8 x fp8 directly.
+        model_dtype = vllm_config.model_config.dtype
+        # The unquantized indexer cache follows the model dtype (fp16 on
+        # pre-Ampere GPUs, which have no bf16).
+        default_indexer_kv_dtype = "fp16" if model_dtype == torch.float16 else "bf16"
         self.indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(
-            "bf16"
+            default_indexer_kv_dtype
         )
         if self.indexer_kv_dtype == "fp8":
             indexer_dtype = torch.float8_e4m3fn
         elif self.indexer_kv_dtype == "bf16":
             indexer_dtype = torch.bfloat16
+        elif self.indexer_kv_dtype == "fp16":
+            indexer_dtype = torch.float16
         else:
             raise NotImplementedError(
                 f"indexer_kv_dtype={self.indexer_kv_dtype!r} is not supported "
-                "by the Qwen4Exp QSA indexer (only 'bf16' or 'fp8')."
+                "by the Qwen4Exp QSA indexer (only 'bf16', 'fp16' or 'fp8')."
             )
         self.indexer_dtype = indexer_dtype
         self.raw_key_cache = QSAKeyStateCache(
             head_size=self.index_head_dim,
-            dtype=torch.bfloat16,
+            dtype=model_dtype,
             cache_rope_positions=vllm_config.model_config.uses_mrope,
             prefix=f"{cache_prefix}raw_key_cache",
             cache_config=cache_config,

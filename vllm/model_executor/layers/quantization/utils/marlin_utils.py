@@ -415,6 +415,29 @@ def marlin_make_workspace_new(
     return torch.zeros(sms * max_blocks_per_sm, dtype=torch.int, device=device)
 
 
+_MARLIN_LOCKS_PER_CALL: dict[int, bool] = {}
+
+
+def _marlin_locks_per_call(device: torch.device) -> bool:
+    """Pre-Ampere GPUs (sm75) allocate the Marlin lock workspace per call.
+
+    With the shared persistent workspace (#57421) the MoE Marlin kernel runs
+    ~20% slower per call on an RTX 8000 (64K x2 decode, light torch profiler:
+    55.2 us vs 45.8 us on the previous base); a freshly allocated zeroed buffer
+    per call restores 43.1 us and the b2 decode step goes from 29.04 to 27.43
+    ms. Re-zeroing the shared buffer in place does not help (59.0 us), so the
+    effect is tied to the persistent buffer itself. A few hundred ints from the
+    caching allocator per Marlin call is the pre-#57421 behaviour.
+    """
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    cached = _MARLIN_LOCKS_PER_CALL.get(idx)
+    if cached is None:
+        major, _ = torch.cuda.get_device_capability(idx)
+        cached = major < 8
+        _MARLIN_LOCKS_PER_CALL[idx] = cached
+    return cached
+
+
 def get_marlin_workspace(device: torch.device) -> torch.Tensor:
     """Get zero-initialized locks for the current stream, ubatch, and lane.
 
@@ -426,7 +449,7 @@ def get_marlin_workspace(device: torch.device) -> torch.Tensor:
         is_workspace_manager_initialized,
     )
 
-    if not is_workspace_manager_initialized():
+    if not is_workspace_manager_initialized() or _marlin_locks_per_call(device):
         return marlin_make_workspace_new(device, MARLIN_MAX_BLOCKS_PER_SM)
 
     return current_workspace_manager().get_persistent(

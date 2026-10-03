@@ -8,12 +8,40 @@ from functools import lru_cache
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
     triton_scalar_specialization_rep,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+
+from .turing_autotune import (
+    ShapeTuner,
+    bucket_steps,
+    fits_smem,
+    turing_autotune_enabled,
+)
+
+logger = init_logger(__name__)
+
+_PRE_AMPERE: bool | None = None
+
+
+def _is_pre_ampere() -> bool:
+    """True on CUDA GPUs below compute capability 8.0 (64 KiB smem/block)."""
+    global _PRE_AMPERE
+    if _PRE_AMPERE is None:
+        try:
+            from vllm.platforms import current_platform
+
+            _PRE_AMPERE = bool(
+                current_platform.is_cuda()
+                and not current_platform.has_device_capability(80)
+            )
+        except Exception:
+            _PRE_AMPERE = False
+    return _PRE_AMPERE
 
 
 @lru_cache(maxsize=1)
@@ -585,10 +613,71 @@ def _select_config(
         BLOCK_N, target_splits, num_warps = 64, 4, 2
     else:
         BLOCK_N, target_splits, num_warps = 64, 1, 2
+    if _is_pre_ampere():
+        # Turing (sm75) has 64 KiB of shared memory per block. With
+        # HEAD_DIM=256 and num_stages=2 the 64- and 32-column K/V tiles do not
+        # fit (Triton OutOfResources at compile). A 16-column tile with four
+        # warps launches (1cat-vLLM #469 measured it on RTX 8000); fewer
+        # splits keep the merge kernel's BLOCK_SPLITS x HEAD_DIM fp32 reduce
+        # under Turing's 255-register budget.
+        BLOCK_N = 16
+        num_warps = 4
+        target_splits = min(target_splits, 16)
     num_tiles = triton.cdiv(num_columns, BLOCK_N)
     # Never more splits than tiles, never empty.
     num_splits = min(target_splits, num_tiles)
     return BLOCK_N, num_warps, num_tiles, num_splits
+
+
+# Opt-in Turing autotune (VLLM_QWEN4_TURING_AUTOTUNE=1) for the PREFILL path of
+# the split-K kernel: use_prefill_config batches only. Decode/verify batches are
+# CUDA-graph captured and always take the fixed profile above.
+#
+# Candidates are (BLOCK_N, num_warps). num_stages is left at the fixed 2:
+# sm75 has no cp.async, and the RTX 8000 probe (tools/tile_probe.py) reports
+# identical shared memory, registers and spills for num_stages 1 and 2.
+# num_warps=2 is excluded: 255 registers with 158-514 spills at every BLOCK_N.
+_TURING_PREFILL_BLOCK_N = (16, 32)
+_TURING_PREFILL_WARPS = (4, 8)
+# Coarse key: one benchmarking event per (row bucket, kv heads, width, dtype).
+# The buckets mirror the regions of the fixed table (split-K small batch,
+# mid, base_programs > 2048).
+_TURING_PREFILL_ROW_BUCKETS = (256, 2048, 1 << 30)
+_TURING_PREFILL_TUNER = ShapeTuner("_qsa_sparse_paged_gqa_splitk_kernel/prefill")
+
+
+def _turing_splitk_smem_bytes(
+    block_m: int, block_n: int, head_dim: int, elem_size: int
+) -> int:
+    """Static shared-memory estimate of the split-K kernel on sm75.
+
+    Fitted to the RTX 8000 probe (Triton 3.7, HEAD_DIM=256, BLOCK_M=16, fp16):
+    BLOCK_N=16 -> 32 KiB, 32 -> 48 KiB, 64 -> 80 KiB, i.e. the Q operand is
+    staged twice (blocked layout + dot operand) and the K and V tiles once,
+    independent of num_stages (no cp.async double-buffering below sm80).
+    """
+    q_tile = block_m * head_dim * elem_size
+    kv_tiles = 2 * block_n * head_dim * elem_size
+    return 2 * q_tile + kv_tiles
+
+
+def _turing_prefill_candidates(
+    block_m: int, head_dim: int, elem_size: int, fixed: tuple[int, int]
+) -> list[tuple[int, int]]:
+    """(BLOCK_N, num_warps) candidates that fit the smem budget; fixed first."""
+    candidates = [fixed]
+    for block_n in _TURING_PREFILL_BLOCK_N:
+        if not fits_smem(_turing_splitk_smem_bytes(block_m, block_n, head_dim, elem_size)):
+            continue
+        for num_warps in _TURING_PREFILL_WARPS:
+            candidate = (block_n, num_warps)
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def _describe_splitk(candidate: tuple[int, int]) -> str:
+    return f"BLOCK_N={candidate[0]}, num_warps={candidate[1]}"
 
 
 def qsa_sparse_paged_attention(
@@ -634,7 +723,7 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == torch.bfloat16
+    assert q.dtype in (torch.bfloat16, torch.float16)
     assert k_cache.dtype == v_cache.dtype
     is_fp8 = k_cache.dtype == torch.float8_e4m3fn
     if is_fp8:
@@ -644,7 +733,9 @@ def qsa_sparse_paged_attention(
         softmax_scale = (head_dim**-0.5) * float(k_scale)
         output_scale = float(v_scale)
     else:
-        assert k_cache.dtype == torch.bfloat16
+        # Unquantized caches carry the model dtype (bf16, or fp16 on
+        # pre-Ampere GPUs, which have no bf16).
+        assert k_cache.dtype == q.dtype
         softmax_scale = head_dim**-0.5
         output_scale = 1.0
     assert logical_indices.dtype == block_table.dtype == torch.int32
@@ -674,6 +765,76 @@ def qsa_sparse_paged_attention(
         q.shape[0], k_cache.shape[2], use_prefill_config, selection_width, is_fp8
     )
 
+    def _run(candidate: tuple[int, int]) -> None:
+        # Idempotent full launch for one (BLOCK_N, num_warps): the tile count
+        # follows BLOCK_N and the split count never exceeds the fixed one.
+        block_n, partial_warps = candidate
+        num_tiles = triton.cdiv(selection_width, block_n)
+        num_splits_c = min(num_splits, num_tiles)
+        _launch_qsa_sparse_paged_attention(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            out,
+            group_size,
+            block_m,
+            block_n,
+            partial_warps,
+            selection_width,
+            num_tiles,
+            num_splits_c,
+            softmax_scale,
+            output_scale,
+            output_gate_view,
+            is_fp8,
+        )
+
+    if use_prefill_config and turing_autotune_enabled():
+        fixed = (block_n, partial_warps)
+        key = (
+            bucket_steps(q.shape[0], _TURING_PREFILL_ROW_BUCKETS),
+            k_cache.shape[2],
+            selection_width,
+            q.dtype,
+            k_cache.dtype,
+            k_cache.shape[1],
+            group_size,
+            num_splits,
+        )
+        candidates = _turing_prefill_candidates(
+            block_m, head_dim, q.element_size(), fixed
+        )
+        block_n, partial_warps = _TURING_PREFILL_TUNER.choose(
+            key, candidates, fixed, _run, _describe_splitk,
+            outputs=lambda: (out,),
+        )
+    _run((block_n, partial_warps))
+    return out
+
+
+def _launch_qsa_sparse_paged_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    out: torch.Tensor,
+    group_size: int,
+    block_m: int,
+    block_n: int,
+    partial_warps: int,
+    selection_width: int,
+    num_tiles: int,
+    num_splits: int,
+    softmax_scale: float,
+    output_scale: float,
+    output_gate_view: torch.Tensor,
+    is_fp8: bool,
+) -> None:
     # Split=1 writes output directly and compiles out all workspace accesses.
     if num_splits == 1:
         partial_output = out
@@ -736,7 +897,7 @@ def qsa_sparse_paged_attention(
         num_stages=2,
     )
     if num_splits == 1:
-        return out
+        return
 
     _qsa_merge_splitk_kernel[(q.shape[0], q.shape[1])](
         partial_output,
@@ -755,7 +916,6 @@ def qsa_sparse_paged_attention(
         num_warps=2,
         num_stages=1,
     )
-    return out
 
 
 def warmup_qsa_sparse_paged_attention(
@@ -771,6 +931,9 @@ def warmup_qsa_sparse_paged_attention(
     # An fp8 cache is allocated as uint8 and viewed as e4m3 at attention time.
     is_fp8 = kv_cache.dtype == torch.uint8
     cache_dtype = torch.float8_e4m3fn if is_fp8 else key_cache.dtype
+    # The query keeps the model dtype (bf16, or fp16 on pre-Ampere GPUs);
+    # a quantized cache says nothing about it, so fall back to bf16 there.
+    q_dtype = key_cache.dtype if key_cache.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
     num_kv_heads = key_cache.shape[2]
     group_size = num_query_heads // num_kv_heads
     block_m = triton.next_power_of_2(group_size)
@@ -783,6 +946,22 @@ def warmup_qsa_sparse_paged_attention(
         for num_rows in range(1, 8193)
         for use_prefill_config in (False, True)
     }
+    specs = sorted(profiles)
+    if turing_autotune_enabled():
+        # Pre-compile the opt-in prefill candidates too, so the first prefill
+        # of each shape bucket only benchmarks (compiles hit the Triton cache).
+        prefill_profiles = {
+            _select_config(num_rows, num_kv_heads, True, selection_width)
+            for num_rows in range(1, 8193)
+        }
+        for block_n, warps, _num_tiles, num_splits in sorted(prefill_profiles):
+            for cand_n, cand_w in _turing_prefill_candidates(
+                block_m, head_dim, key_cache.dtype.itemsize, (block_n, warps)
+            ):
+                cand_tiles = triton.cdiv(selection_width, cand_n)
+                spec = (cand_n, cand_w, cand_tiles, min(num_splits, cand_tiles))
+                if spec not in profiles and spec not in specs:
+                    specs.append(spec)
 
     # Scalars constant per deployment get their real values (their divisibility
     # specialization is wanted); the batch-varying ones are do_not_specialize'd
@@ -790,7 +969,7 @@ def warmup_qsa_sparse_paged_attention(
     num_rows = 16
     num_requests = 16
     q_ptr = TritonWarmupTensor(
-        torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
+        q_dtype, shape=(num_rows, num_query_heads, head_dim)
     )
     k_cache_ptr = TritonWarmupTensor(
         cache_dtype,
@@ -811,18 +990,18 @@ def warmup_qsa_sparse_paged_attention(
     )
     token_to_req_ptr = TritonWarmupTensor(torch.int32)
     output_ptr = TritonWarmupTensor(
-        torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
+        q_dtype, shape=(num_rows, num_query_heads, head_dim)
     )
     # The output gate is mandatory at runtime; warm the gated specialization.
     output_gate_ptr = TritonWarmupTensor(
-        torch.bfloat16, shape=(num_rows, num_query_heads, head_dim)
+        q_dtype, shape=(num_rows, num_query_heads, head_dim)
     )
     head_stride = head_dim
     row_stride = num_query_heads * head_dim
     num_cache_blocks = triton_scalar_specialization_rep(kv_cache.shape[0])
 
     warmed = []
-    for block_n, warps, num_tiles, num_splits in sorted(profiles):
+    for block_n, warps, num_tiles, num_splits in specs:
         if num_splits == 1:
             partial_output_ptr = output_ptr
             partial_lse_ptr = output_ptr
@@ -834,51 +1013,65 @@ def warmup_qsa_sparse_paged_attention(
             partial_lse_ptr = TritonWarmupTensor(
                 torch.float32, shape=(num_splits, num_rows, num_query_heads)
             )
-        _qsa_sparse_paged_gqa_splitk_kernel.warmup(
-            q_ptr,
-            k_cache_ptr,
-            v_cache_ptr,
-            indices_ptr,
-            block_table_ptr,
-            token_to_req_ptr,
-            partial_output_ptr,
-            partial_lse_ptr,
-            output_ptr,
-            1.0,
-            1.0,
-            output_gate_ptr,
-            row_stride,
-            head_stride,
-            key_cache.stride(0),
-            key_cache.stride(1),
-            key_cache.stride(2),
-            value_cache.stride(0),
-            value_cache.stride(1),
-            value_cache.stride(2),
-            selection_width + 1,
-            block_table.stride(0),
-            row_stride,
-            head_stride,
-            row_stride,
-            head_stride,
-            num_rows,
-            num_cache_blocks,
-            num_requests,
-            TOPK=selection_width,
-            PAGE_SIZE=key_cache.shape[1],
-            PAGE_TABLE_WIDTH=block_table.shape[1],
-            GROUP_SIZE=group_size,
-            HEAD_DIM=head_dim,
-            NUM_QUERY_HEADS=num_query_heads,
-            NUM_SPLITS=num_splits,
-            NUM_TILES=num_tiles,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
-            IS_FP8=is_fp8,
-            num_warps=warps,
-            num_stages=2,
-            grid=(num_rows, num_kv_heads, num_splits),
-        )
+        try:
+            _qsa_sparse_paged_gqa_splitk_kernel.warmup(
+                q_ptr,
+                k_cache_ptr,
+                v_cache_ptr,
+                indices_ptr,
+                block_table_ptr,
+                token_to_req_ptr,
+                partial_output_ptr,
+                partial_lse_ptr,
+                output_ptr,
+                1.0,
+                1.0,
+                output_gate_ptr,
+                row_stride,
+                head_stride,
+                key_cache.stride(0),
+                key_cache.stride(1),
+                key_cache.stride(2),
+                value_cache.stride(0),
+                value_cache.stride(1),
+                value_cache.stride(2),
+                selection_width + 1,
+                block_table.stride(0),
+                row_stride,
+                head_stride,
+                row_stride,
+                head_stride,
+                num_rows,
+                num_cache_blocks,
+                num_requests,
+                TOPK=selection_width,
+                PAGE_SIZE=key_cache.shape[1],
+                PAGE_TABLE_WIDTH=block_table.shape[1],
+                GROUP_SIZE=group_size,
+                HEAD_DIM=head_dim,
+                NUM_QUERY_HEADS=num_query_heads,
+                NUM_SPLITS=num_splits,
+                NUM_TILES=num_tiles,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                IS_FP8=is_fp8,
+                num_warps=warps,
+                num_stages=2,
+                grid=(num_rows, num_kv_heads, num_splits),
+            )
+        except Exception as exc:
+            # A fixed profile must compile; an autotune candidate that does
+            # not fit is simply not pre-compiled (it scores +inf if tried).
+            if (block_n, warps, num_tiles, num_splits) in profiles:
+                raise
+            logger.warning(
+                "Turing autotune candidate BLOCK_N=%d, num_warps=%d skipped "
+                "at warmup: %s",
+                block_n,
+                warps,
+                str(exc).splitlines()[0][:120] if str(exc) else type(exc),
+            )
+            continue
         if num_splits > 1:
             _qsa_merge_splitk_kernel.warmup(
                 partial_output_ptr,

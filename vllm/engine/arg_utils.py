@@ -670,6 +670,8 @@ class EngineArgs:
 
     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
+    prefill_schedule_interval_low: int = SchedulerConfig.prefill_schedule_interval_low
+    prefill_schedule_long_tokens: int = SchedulerConfig.prefill_schedule_long_tokens
 
     watermark: float = SchedulerConfig.watermark
 
@@ -812,7 +814,7 @@ class EngineArgs:
     )
 
     fail_on_environ_validation: bool = False
-    gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl"] | None = None
+    gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl", "flashqla_sm75"] | None = None
     kda_prefill_backend: (
         Literal["auto", "triton", "flashkda", "flashinfer", "fused"] | None
     ) = None
@@ -1678,6 +1680,14 @@ class EngineArgs:
             **scheduler_kwargs["prefill_schedule_interval"],
         )
         scheduler_group.add_argument(
+            "--prefill-schedule-interval-low",
+            **scheduler_kwargs["prefill_schedule_interval_low"],
+        )
+        scheduler_group.add_argument(
+            "--prefill-schedule-long-tokens",
+            **scheduler_kwargs["prefill_schedule_long_tokens"],
+        )
+        scheduler_group.add_argument(
             "--disable-hybrid-kv-cache-manager",
             **scheduler_kwargs["disable_hybrid_kv_cache_manager"],
         )
@@ -1819,7 +1829,7 @@ class EngineArgs:
         parser.add_argument(
             "--gdn-prefill-backend",
             dest="gdn_prefill_backend",
-            choices=["flashinfer", "triton", "cutedsl"],
+            choices=["flashinfer", "triton", "cutedsl", "flashqla_sm75"],
             default=None,
             help="Select GDN prefill backend.",
         )
@@ -2502,6 +2512,8 @@ class EngineArgs:
             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             watermark=self.watermark,
             prefill_schedule_interval=self.prefill_schedule_interval,
+            prefill_schedule_interval_low=self.prefill_schedule_interval_low,
+            prefill_schedule_long_tokens=self.prefill_schedule_long_tokens,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,

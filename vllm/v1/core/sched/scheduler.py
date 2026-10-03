@@ -596,11 +596,35 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
-        # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
-        # all prefill compute unless saturated.
+        # On a throttled (non-cadence-aligned) step, defer all prefill compute.
+        # DP prefill balancing (throttle_prefills from the DP engine core) lifts
+        # the deferral when the queue is capacity-bound. Without DP the interval
+        # is a decode-protection cadence owned here: no decoding sequence ->
+        # no cadence; decoding while a long prefill (>= prefill_schedule_long_tokens
+        # still to compute) is in flight -> the full interval; decoding with only
+        # short prefills -> the low interval. Saturation does not lift it.
+        is_dp = self.vllm_config.parallel_config.data_parallel_size > 1
+        num_decoding = sum(1 for r in self.running if not r.is_prefill_chunk)
+        if not is_dp:
+            interval = self.scheduler_config.prefill_schedule_interval
+            if interval > 1 and num_decoding > 0:
+                long_tokens = self.scheduler_config.prefill_schedule_long_tokens
+                long_inflight = any(
+                    r.is_prefill_chunk
+                    and r.num_tokens - r.num_computed_tokens >= long_tokens
+                    for r in self.running
+                )
+                n_eff = (
+                    interval
+                    if long_inflight
+                    else min(self.scheduler_config.prefill_schedule_interval_low, interval)
+                )
+                throttle_prefills = n_eff > 1 and self.current_step % n_eff != 0
+            else:
+                throttle_prefills = False
         defer_prefills = (
-            throttle_prefills and not self.prefill_capacity_bound
-        ) and any(not r.is_prefill_chunk for r in self.running)
+            throttle_prefills and (not self.prefill_capacity_bound or not is_dp)
+        ) and num_decoding > 0
 
         # `long_prefill_token_threshold` exists to stop a long prefill from
         # starving other requests of the token budget. When it is the only

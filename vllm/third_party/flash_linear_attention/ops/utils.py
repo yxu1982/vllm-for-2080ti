@@ -198,3 +198,78 @@ def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
         return max_shared_memory >= Backend.get_shared_memory(arch)
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Opt-in Turing (sm75) autotune lists: VLLM_QWEN4_TURING_AUTOTUNE=1 on a
+# pre-Ampere CUDA device. The chunk kernels below are already autotuned with
+# coarse shape keys (H, K, V, BT); with the flag off their config lists are
+# untouched. With the flag on, each kernel swaps in a Turing list:
+#   * num_stages collapsed to [2]: sm75 has no cp.async, and the RTX 8000
+#     probe of the QSA kernels shows num_stages changing neither shared
+#     memory, registers nor spills. This removes the 3-4x duplicate compiles
+#     of otherwise identical kernels at engine warmup.
+#   * tiles scaled down from the Ampere lists (BV/BK 16 added) and 8 warps
+#     added where the Turing list lacked it.
+#   * prune_configs_by drops any config whose static single-buffered operand
+#     estimate exceeds TURING_SMEM_BUDGET (60 KiB) before it is compiled
+#     (below sm80 Triton stages each tl.dot operand once, so the estimate
+#     is the sum of the fp16 operand tiles of one loop iteration).
+# Benchmarking still happens where it always did: the GDN prefill warmup
+# during the V1 profile run (_warmup_prefill_kernels), never in a CUDA graph.
+def _turing_autotune_enabled() -> bool:
+    # Same gate as vllm.models.qwen4_exp.nvidia.ops.turing_autotune, restated
+    # here so this package does not import the model package at import time.
+    try:
+        import vllm.envs as envs
+
+        return (
+            bool(envs.VLLM_QWEN4_TURING_AUTOTUNE)
+            and current_platform.is_cuda()
+            and not current_platform.has_device_capability(80)
+        )
+    except Exception:
+        return False
+
+
+TURING_AUTOTUNE = _turing_autotune_enabled()
+TURING_SMEM_BUDGET = 60 * 1024
+TURING_NUM_STAGES = [2]
+
+
+def turing_smem_prune(estimate: Callable[[dict, dict], int]) -> dict:
+    """Build a ``prune_configs_by`` dict from a static smem estimator.
+
+    ``estimate(config_kwargs, named_args)`` returns bytes; configs over
+    ``TURING_SMEM_BUDGET`` are removed before compilation. If every config
+    would be pruned the list is returned unchanged so the autotuner can still
+    self-heal (over-budget configs score +inf when they fail to compile).
+    """
+
+    def early_config_prune(configs, named_args, **kwargs):
+        # Triton passes positional launch args in named_args and keyword
+        # launch args (these wrappers pass BT/K/V and most tensors by
+        # keyword) in kwargs; the estimators want one mapping.
+        args = dict(named_args)
+        args.update(kwargs)
+        kept = [
+            config
+            for config in configs
+            if estimate(config.kwargs, args) <= TURING_SMEM_BUDGET
+        ]
+        if len(kept) != len(configs) and os.environ.get(
+            "TRITON_PRINT_AUTOTUNING", "0"
+        ) == "1":
+            dropped = [c for c in configs if c not in kept]
+            print(
+                f"Turing smem prune: dropped {len(dropped)} of {len(configs)} "
+                f"configs: {[str(c) for c in dropped]}"
+            )
+        return kept or configs
+
+    return {"early_config_prune": early_config_prune}
+
+
+def _elem_size(named_args: dict, name: str) -> int:
+    tensor = named_args.get(name)
+    return tensor.element_size() if isinstance(tensor, torch.Tensor) else 2

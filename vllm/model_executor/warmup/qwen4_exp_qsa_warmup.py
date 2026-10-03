@@ -70,6 +70,23 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
     )
     logger.info("Warmed up Qwen4Exp QSA decode kernels: %s.", profiles)
 
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_indexer import (
+        warmup_qsa_mqa_paged_prefill_turing_candidates,
+    )
+
+    prefill_candidates = warmup_qsa_mqa_paged_prefill_turing_candidates(
+        k_cache,
+        block_table_for(indexer.compressed_key_cache.prefix),
+        num_heads=indexer.index_n_heads,
+        head_dim=indexer.index_head_dim,
+    )
+    if prefill_candidates:
+        logger.info(
+            "Pre-compiled Qwen4Exp QSA indexer prefill Turing autotune "
+            "candidates: %s.",
+            prefill_candidates,
+        )
+
     from vllm.models.qwen4_exp.nvidia.ops.qsa import (
         warmup_qsa_sparse_paged_attention,
     )

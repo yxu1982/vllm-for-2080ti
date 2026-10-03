@@ -8,6 +8,64 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from .turing_autotune import ShapeTuner, bucket_steps, turing_autotune_enabled
+
+# Opt-in Turing autotune (VLLM_QWEN4_TURING_AUTOTUNE=1) for the row-wise HC
+# kernels. They run at every batch size; only launches with at least
+# _TURING_MIN_ROWS rows are tuned (prefill-sized), and never during CUDA-graph
+# capture, so decode graphs keep the fixed BLOCK_SIZE=512 / default-warps
+# launch. Candidates are (BLOCK_SIZE, num_warps) for the tiled kernels and
+# num_warps alone for the whole-row kernels; every candidate is KiB-scale in
+# shared memory, so no smem filter is needed. A candidate's num_warps=None
+# means "launch exactly as before" (Triton's default of 4 warps).
+_TURING_MIN_ROWS = 64
+_TURING_ROW_BUCKETS = (256, 1024, 4096, 1 << 30)
+_TURING_BLOCK_SIZES = (256, 512, 1024)
+_TURING_WARPS = (2, 4, 8)
+_TURING_ROW_WARPS = (1, 2, 4, 8)
+_TURING_TUNERS: dict[str, ShapeTuner] = {}
+
+
+def _turing_tuner(name: str) -> ShapeTuner:
+    tuner = _TURING_TUNERS.get(name)
+    if tuner is None:
+        tuner = _TURING_TUNERS[name] = ShapeTuner(name)
+    return tuner
+
+
+def _turing_tiled_candidates(fixed):
+    candidates = [fixed]
+    for block_size in _TURING_BLOCK_SIZES:
+        for num_warps in _TURING_WARPS:
+            candidate = (block_size, num_warps)
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def _turing_row_candidates(fixed):
+    candidates = [fixed]
+    for num_warps in _TURING_ROW_WARPS:
+        if num_warps not in candidates:
+            candidates.append(num_warps)
+    return candidates
+
+
+def _turing_tunable(num_rows: int) -> bool:
+    return num_rows >= _TURING_MIN_ROWS and turing_autotune_enabled()
+
+
+def _warps_kwargs(num_warps):
+    return {} if num_warps is None else {"num_warps": num_warps}
+
+
+def _describe_tiled(candidate) -> str:
+    return f"BLOCK_SIZE={candidate[0]}, num_warps={candidate[1] or 'default'}"
+
+
+def _describe_row(candidate) -> str:
+    return f"num_warps={candidate or 'default'}"
+
 
 @triton.jit
 def _grouped_gemma_rmsnorm_kernel(
@@ -63,18 +121,30 @@ def _grouped_gemma_rmsnorm(
     assert weight.numel() in (group_dim, DIM)
 
     y = x.new_empty(x.shape)
-    _grouped_gemma_rmsnorm_kernel[(N * num_groups,)](
-        x,
-        weight,
-        y,
-        x.stride(0),
-        y.stride(0),
-        DIM,
-        num_groups,
-        W_SHARED=weight.numel() == group_dim,
-        EPS=eps,
-        launch_pdl=current_platform.is_arch_support_pdl(),
-    )
+
+    def _run(num_warps) -> None:
+        _grouped_gemma_rmsnorm_kernel[(N * num_groups,)](
+            x,
+            weight,
+            y,
+            x.stride(0),
+            y.stride(0),
+            DIM,
+            num_groups,
+            W_SHARED=weight.numel() == group_dim,
+            EPS=eps,
+            launch_pdl=current_platform.is_arch_support_pdl(),
+            **_warps_kwargs(num_warps),
+        )
+
+    num_warps = None
+    if _turing_tunable(N):
+        key = (bucket_steps(N, _TURING_ROW_BUCKETS), DIM, num_groups, x.dtype)
+        num_warps = _turing_tuner("_grouped_gemma_rmsnorm_kernel").choose(
+            key, _turing_row_candidates(None), None, _run, _describe_row,
+            outputs=lambda: (y,),
+        )
+    _run(num_warps)
     return y
 
 
@@ -110,15 +180,27 @@ def _hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
     assert x.stride(1) == 1
 
     output = x.new_empty(x.shape)
-    _hc_silu_kernel[(num_tokens,)](
-        x,
-        output,
-        x.stride(0),
-        output.stride(0),
-        DIM=DIM,
-        HC=hc_count,
-        launch_pdl=current_platform.is_arch_support_pdl(),
-    )
+
+    def _run(num_warps) -> None:
+        _hc_silu_kernel[(num_tokens,)](
+            x,
+            output,
+            x.stride(0),
+            output.stride(0),
+            DIM=DIM,
+            HC=hc_count,
+            launch_pdl=current_platform.is_arch_support_pdl(),
+            **_warps_kwargs(num_warps),
+        )
+
+    num_warps = None
+    if _turing_tunable(num_tokens):
+        key = (bucket_steps(num_tokens, _TURING_ROW_BUCKETS), DIM, hc_count, x.dtype)
+        num_warps = _turing_tuner("_hc_silu_kernel").choose(
+            key, _turing_row_candidates(None), None, _run, _describe_row,
+            outputs=lambda: (output,),
+        )
+    _run(num_warps)
     return output
 
 
@@ -169,19 +251,31 @@ def _hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Te
 
     HC_DIM = DIM // hc_count
     out = x.new_empty(N, HC_DIM)
-    BLOCK_SIZE = 512
-    _hc_gate_mix_kernel[(N, triton.cdiv(HC_DIM, BLOCK_SIZE))](
-        x,
-        gate,
-        out,
-        x.stride(0),
-        gate.stride(0),
-        out.stride(0),
-        DIM,
-        hc_count,
-        BLOCK_SIZE,
-        launch_pdl=current_platform.is_arch_support_pdl(),
-    )
+
+    def _run(candidate) -> None:
+        BLOCK_SIZE, num_warps = candidate
+        _hc_gate_mix_kernel[(N, triton.cdiv(HC_DIM, BLOCK_SIZE))](
+            x,
+            gate,
+            out,
+            x.stride(0),
+            gate.stride(0),
+            out.stride(0),
+            DIM,
+            hc_count,
+            BLOCK_SIZE,
+            launch_pdl=current_platform.is_arch_support_pdl(),
+            **_warps_kwargs(num_warps),
+        )
+
+    config = (512, None)
+    if _turing_tunable(N):
+        key = (bucket_steps(N, _TURING_ROW_BUCKETS), DIM, hc_count, x.dtype)
+        config = _turing_tuner("_hc_gate_mix_kernel").choose(
+            key, _turing_tiled_candidates(config), config, _run, _describe_tiled,
+            outputs=lambda: (out,),
+        )
+    _run(config)
     return out
 
 
@@ -251,21 +345,39 @@ def _hc_combine(
     stride_injection = injection_logits.stride(0) if injection_logits is not None else 0
 
     out = residual.new_empty(residual.shape)
-    BLOCK_SIZE = 512
-    _hc_combine_kernel[(N, triton.cdiv(hc_dim, BLOCK_SIZE))](
-        block_output,
-        residual,
-        injection_logits,
-        out,
-        block_output.stride(0),
-        residual.stride(0),
-        stride_injection,
-        out.stride(0),
-        hc_dim,
-        hc_count,
-        BLOCK_SIZE,
-        launch_pdl=current_platform.is_arch_support_pdl(),
-    )
+
+    def _run(candidate) -> None:
+        BLOCK_SIZE, num_warps = candidate
+        _hc_combine_kernel[(N, triton.cdiv(hc_dim, BLOCK_SIZE))](
+            block_output,
+            residual,
+            injection_logits,
+            out,
+            block_output.stride(0),
+            residual.stride(0),
+            stride_injection,
+            out.stride(0),
+            hc_dim,
+            hc_count,
+            BLOCK_SIZE,
+            launch_pdl=current_platform.is_arch_support_pdl(),
+            **_warps_kwargs(num_warps),
+        )
+
+    config = (512, None)
+    if _turing_tunable(N):
+        key = (
+            bucket_steps(N, _TURING_ROW_BUCKETS),
+            DIM,
+            hc_count,
+            injection_logits is not None,
+            residual.dtype,
+        )
+        config = _turing_tuner("_hc_combine_kernel").choose(
+            key, _turing_tiled_candidates(config), config, _run, _describe_tiled,
+            outputs=lambda: (out,),
+        )
+    _run(config)
     return out
 
 
@@ -369,26 +481,45 @@ def _hc_combine_norm(
 
     out = residual.new_empty(residual.shape)
     y = residual.new_empty(residual.shape)
-    BLOCK_SIZE = 512
-    _hc_combine_norm_kernel[(N * hc_count,)](
-        block_output,
-        residual,
-        injection_logits,
-        norm_weight,
-        out,
-        y,
-        block_output.stride(0),
-        residual.stride(0),
-        stride_injection,
-        out.stride(0),
-        y.stride(0),
-        hc_dim,
-        hc_count,
-        W_SHARED=norm_weight.numel() == hc_dim,
-        EPS=eps,
-        BLOCK_SIZE=BLOCK_SIZE,
-        launch_pdl=current_platform.is_arch_support_pdl(),
-    )
+
+    def _run(candidate) -> None:
+        BLOCK_SIZE, num_warps = candidate
+        _hc_combine_norm_kernel[(N * hc_count,)](
+            block_output,
+            residual,
+            injection_logits,
+            norm_weight,
+            out,
+            y,
+            block_output.stride(0),
+            residual.stride(0),
+            stride_injection,
+            out.stride(0),
+            y.stride(0),
+            hc_dim,
+            hc_count,
+            W_SHARED=norm_weight.numel() == hc_dim,
+            EPS=eps,
+            BLOCK_SIZE=BLOCK_SIZE,
+            launch_pdl=current_platform.is_arch_support_pdl(),
+            **_warps_kwargs(num_warps),
+        )
+
+    config = (512, None)
+    if _turing_tunable(N):
+        key = (
+            bucket_steps(N, _TURING_ROW_BUCKETS),
+            DIM,
+            hc_count,
+            injection_logits is not None,
+            norm_weight.numel() == hc_dim,
+            residual.dtype,
+        )
+        config = _turing_tuner("_hc_combine_norm_kernel").choose(
+            key, _turing_tiled_candidates(config), config, _run, _describe_tiled,
+            outputs=lambda: (out,),
+        )
+    _run(config)
     return out, y
 
 

@@ -2,17 +2,89 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton kernels for Qwen4Exp QSA index selection."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+from .turing_autotune import (
+    ShapeTuner,
+    bucket_steps,
+    fits_smem,
+    is_pre_ampere,
+    turing_autotune_enabled,
+)
+
+logger = init_logger(__name__)
+
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 _DECODE_BLOCK_N = 64
+
+# Opt-in Turing autotune (VLLM_QWEN4_TURING_AUTOTUNE=1) for the prefill scoring
+# kernel _qsa_mqa_paged_prefill_kernel. Candidates are (TILE_R, BLOCK_N,
+# num_warps); STAGES and K_TILES keep the fixed profile's values (the RTX 8000
+# probe shows STAGES changes neither smem nor registers on sm75, and K_TILES
+# only re-splits the grid). TILE_R=32 never fits (80-96 KiB measured) and is
+# dropped by the estimate; TILE_R=16/BLOCK_N=64 is exactly 64 KiB with
+# 494-814 spills and is dropped by the 60 KiB budget.
+_TURING_PREFILL_TILE_R = (8, 16, 32)
+_TURING_PREFILL_BLOCK_N = (32, 64)
+_TURING_PREFILL_WARPS = (4, 8)
+# Coarse key buckets: rows per request tile-loop and logits width (columns).
+_TURING_PREFILL_ROW_BUCKETS = (128, 512, 2048, 1 << 30)
+_TURING_PREFILL_WIDTH_BUCKETS = (1024, 4096, 16384, 1 << 30)
+_TURING_PREFILL_TUNER = ShapeTuner("_qsa_mqa_paged_prefill_kernel")
+
+
+def _turing_prefill_smem_bytes(
+    tile_r: int, block_n: int, num_heads: int, head_dim: int, elem_size: int
+) -> int:
+    """Static shared-memory estimate of the prefill scoring kernel on sm75.
+
+    Fitted to all 36 rows of the RTX 8000 probe (Triton 3.7, 4 heads, D=128,
+    fp16): 2 KiB * TILE_R + 512 B * BLOCK_N, i.e. both dot operands (the
+    resident Q tile [D, TILE_R*heads] and the K tile [BLOCK_N, D]) are staged
+    twice, independent of STAGES.
+    """
+    heads_padded = triton.next_power_of_2(num_heads)
+    block_d = max(16, triton.next_power_of_2(head_dim))
+    q_tile = block_d * tile_r * heads_padded * elem_size
+    k_tile = block_n * block_d * elem_size
+    return 2 * (q_tile + k_tile)
+
+
+def _turing_prefill_candidates(
+    num_heads: int, head_dim: int, elem_size: int, fixed: tuple[int, int, int]
+) -> list[tuple[int, int, int]]:
+    """(TILE_R, BLOCK_N, num_warps) candidates within budget; fixed first."""
+    candidates = [fixed]
+    for tile_r in _TURING_PREFILL_TILE_R:
+        for block_n in _TURING_PREFILL_BLOCK_N:
+            if not fits_smem(
+                _turing_prefill_smem_bytes(
+                    tile_r, block_n, num_heads, head_dim, elem_size
+                )
+            ):
+                continue
+            for num_warps in _TURING_PREFILL_WARPS:
+                candidate = (tile_r, block_n, num_warps)
+                if candidate not in candidates:
+                    candidates.append(candidate)
+    return candidates
+
+
+def _describe_prefill(candidate: tuple[int, int, int]) -> str:
+    return (
+        f"TILE_R={candidate[0]}, BLOCK_N={candidate[1]}, "
+        f"num_warps={candidate[2]}"
+    )
 
 
 @triton.jit
@@ -276,6 +348,39 @@ def _expand_qsa_indices_kernel(
         )
 
 
+# Pre-Ampere (sm75) profile of the uniform decode scoring kernel. The default
+# profile below (BLOCK_N=64, STAGES=2, num_warps=2, one 64-column tile per
+# program in the small-batch region) was tuned on GB300; on the RTX 8000 it is
+# latency-bound. tools/decode_probe2.py (4 heads, D=128, page 400, page-table
+# width 164, MTP K=2 -> 3 query rows per request, 20 candidates checked against
+# the default's output within 2e-2) measures, in us, default -> BLOCK_N=32 with
+# one warp and 4 tiles per program: 1 request 226 -> 53 (64K) / 332 -> 79 (128K);
+# 2 requests 285 -> 83 / 524 -> 144; 4 requests 506 -> 139 / 993 -> 256;
+# 8 requests 1042 -> 262 / 2054 -> 494; 12 requests 1536 -> 440 / 2974 -> 705.
+# 4 tiles is best or within 5% of the best at every (requests, context) row
+# from 16K to 128K and for 1 or 3 query rows; 2 tiles wins only by a few us at
+# 16K. BLOCK_N=128 does not compile on sm75. The kernel runs once per QSA
+# layer per decode step (13 launches with the MTP draft), so the default
+# costs ~2.5 ms of a 27 ms two-stream decode step and ~5 ms at four streams.
+_TURING_DECODE_BLOCK_N = 32
+_TURING_DECODE_TILES = 4
+_TURING_DECODE_WARPS = 1
+
+
+def _decode_profile(
+    num_requests: int, columns: int, cache_dtype: torch.dtype
+) -> tuple[int, int, int]:
+    """(BLOCK_N, TILES_PER_PROG, num_warps) of the uniform decode kernel."""
+    if is_pre_ampere():
+        return _TURING_DECODE_BLOCK_N, _TURING_DECODE_TILES, _TURING_DECODE_WARPS
+    return (
+        _DECODE_BLOCK_N,
+        _decode_tiles_per_program(num_requests, columns),
+        # tuned on GB300
+        1 if cache_dtype == torch.float8_e4m3fn else 2,
+    )
+
+
 def _decode_tiles_per_program(num_requests: int, columns: int) -> int:
     programs = num_requests * triton.cdiv(columns, _DECODE_BLOCK_N)
     if programs < 16384:
@@ -346,7 +451,9 @@ def warmup_qsa_mqa_paged_decode(
             torch.float32,
             shape=(num_rows, columns),
         )
-        tiles_per_program = _decode_tiles_per_program(num_requests, columns)
+        block_n, tiles_per_program, num_warps = _decode_profile(
+            num_requests, columns, k_cache.dtype
+        )
         _qsa_mqa_paged_uniform_kernel.warmup(
             q_ptr,
             k_cache_ptr,
@@ -364,17 +471,19 @@ def warmup_qsa_mqa_paged_decode(
             NUM_HEADS=num_heads,
             HEAD_DIM=head_dim,
             DECODE_QUERY_LEN=decode_query_len,
-            BLOCK_N=_DECODE_BLOCK_N,
+            BLOCK_N=block_n,
             TILES_PER_PROG=tiles_per_program,
             STAGES=2,
-            # tuned on GB300
-            num_warps=1 if k_cache.dtype == torch.float8_e4m3fn else 2,
+            num_warps=num_warps,
             grid=(
                 num_requests,
-                triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
+                triton.cdiv(columns, block_n * tiles_per_program),
             ),
         )
     return profiles
+
+
+_PERSISTENT_LOGITS: dict = {}
 
 
 def _prefill_logits(
@@ -393,45 +502,161 @@ def _prefill_logits(
     assert 0 <= query_offset <= query_offset + num_queries <= q.shape[0]
     assert 0 < logits_width <= page_table.shape[1] * k_cache.shape[1]
 
-    logits = torch.empty(
-        (num_queries, logits_width), dtype=torch.float32, device=q.device
-    )
-    # tuned on GB300
-    if k_cache.dtype == torch.float8_e4m3fn:
-        TILE_R, STAGES, num_warps = 32, 2, 8
+    if os.environ.get("VLLM_QWEN4_INDEXER_PERSISTENT_LOGITS"):
+        # One persistent fp32 buffer per device, grown to the largest shape
+        # seen (bounded by VLLM_SPARSE_INDEXER_MAX_LOGITS_MB): the per-call
+        # torch.empty at a context-dependent width left the caching allocator
+        # holding one block per distinct size (vllm-project/vllm#56457).
+        need = num_queries * logits_width
+        buf = _PERSISTENT_LOGITS.get(q.device)
+        if buf is None or buf.numel() < need:
+            cap = max(need, envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4)
+            buf = torch.empty((cap,), dtype=torch.float32, device=q.device)
+            _PERSISTENT_LOGITS[q.device] = buf
+        logits = buf[:need].view(num_queries, logits_width)
     else:
-        TILE_R, STAGES, num_warps = 64, 2, 4
-    BLOCK_N = 64
+        logits = torch.empty(
+            (num_queries, logits_width), dtype=torch.float32, device=q.device
+        )
+    pre_ampere = not current_platform.has_device_capability(80)
+    if pre_ampere:
+        # Turing (sm75): 64 KiB smem/block. Measured on Quadro RTX 8000
+        # (Triton 3.7): TILE_R=32 needs 80-96 KiB for any BLOCK_N (the fp32
+        # [BLOCK_N, TILE_R*heads] score tile is staged through smem for the
+        # head reduction); TILE_R=16/BLOCK_N=32 compiles at 48 KiB with 72
+        # registers and no spills, the largest zero-spill profile that fits.
+        TILE_R, BLOCK_N, STAGES, num_warps = 16, 32, 2, 8
+    elif k_cache.dtype == torch.float8_e4m3fn:
+        # tuned on GB300
+        TILE_R, BLOCK_N, STAGES, num_warps = 32, 64, 2, 8
+    else:
+        # tuned on GB300
+        TILE_R, BLOCK_N, STAGES, num_warps = 64, 64, 2, 4
     K_TILES = 16
-    grid = (
-        page_table.shape[0],
-        triton.cdiv(min(num_queries, max_query_len), TILE_R),
-        triton.cdiv(logits_width, BLOCK_N * K_TILES),
-    )
-    _qsa_mqa_paged_prefill_kernel[grid](
-        q,
-        k_cache,
-        page_table,
-        query_start_loc,
-        visible_blocks,
-        logits,
-        *q.stride()[:-1],
-        *k_cache.stride()[:2],
-        *page_table.stride()[:-1],
-        *logits.stride()[:-1],
-        num_queries,
-        query_offset,
-        page_table.shape[1],
-        PAGE_SIZE=k_cache.shape[1],
-        NUM_HEADS=q.shape[1],
-        HEAD_DIM=q.shape[2],
-        TILE_R=TILE_R,
-        BLOCK_N=BLOCK_N,
-        K_TILES=K_TILES,
-        STAGES=STAGES,
-        num_warps=num_warps,
-    )
+    rows = min(num_queries, max_query_len)
+
+    def _run(candidate: tuple[int, int, int]) -> None:
+        # Idempotent: every candidate stores the same masked logits.
+        tile_r, block_n, warps = candidate
+        grid = (
+            page_table.shape[0],
+            triton.cdiv(rows, tile_r),
+            triton.cdiv(logits_width, block_n * K_TILES),
+        )
+        _qsa_mqa_paged_prefill_kernel[grid](
+            q,
+            k_cache,
+            page_table,
+            query_start_loc,
+            visible_blocks,
+            logits,
+            *q.stride()[:-1],
+            *k_cache.stride()[:2],
+            *page_table.stride()[:-1],
+            *logits.stride()[:-1],
+            num_queries,
+            query_offset,
+            page_table.shape[1],
+            PAGE_SIZE=k_cache.shape[1],
+            NUM_HEADS=q.shape[1],
+            HEAD_DIM=q.shape[2],
+            TILE_R=tile_r,
+            BLOCK_N=block_n,
+            K_TILES=K_TILES,
+            STAGES=STAGES,
+            num_warps=warps,
+        )
+
+    if pre_ampere and turing_autotune_enabled():
+        fixed = (TILE_R, BLOCK_N, num_warps)
+        key = (
+            bucket_steps(rows, _TURING_PREFILL_ROW_BUCKETS),
+            bucket_steps(logits_width, _TURING_PREFILL_WIDTH_BUCKETS),
+            q.dtype,
+            q.shape[1],
+            q.shape[2],
+            k_cache.shape[1],
+        )
+        candidates = _turing_prefill_candidates(
+            q.shape[1], q.shape[2], q.element_size(), fixed
+        )
+        TILE_R, BLOCK_N, num_warps = _TURING_PREFILL_TUNER.choose(
+            key, candidates, fixed, _run, _describe_prefill,
+            outputs=lambda: (logits,),
+        )
+    _run((TILE_R, BLOCK_N, num_warps))
     return logits
+
+
+def warmup_qsa_mqa_paged_prefill_turing_candidates(
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    *,
+    num_heads: int,
+    head_dim: int,
+) -> tuple[tuple[int, int, int], ...]:
+    """Compile the opt-in Turing prefill candidates without launching them.
+
+    No-op unless VLLM_QWEN4_TURING_AUTOTUNE=1 on a pre-Ampere GPU. Runs at
+    engine warmup so the first prefill of each shape bucket only benchmarks
+    already-compiled kernels.
+    """
+    if not turing_autotune_enabled():
+        return ()
+    fixed = (16, 32, 8)  # the sm75 profile in _prefill_logits
+    candidates = _turing_prefill_candidates(
+        num_heads, head_dim, k_cache.dtype.itemsize, fixed
+    )
+    page_size = k_cache.shape[1]
+    page_table_width = page_table.shape[1]
+    columns = page_table_width * page_size
+    num_rows = 64
+    q_ptr = TritonWarmupTensor(k_cache.dtype, shape=(num_rows, num_heads, head_dim))
+    k_cache_ptr = TritonWarmupTensor(k_cache.dtype, shape=tuple(k_cache.shape))
+    page_table_ptr = TritonWarmupTensor(
+        page_table.dtype, shape=(page_table.shape[0], page_table_width)
+    )
+    query_start_loc_ptr = TritonWarmupTensor(torch.int32)
+    visible_blocks_ptr = TritonWarmupTensor(torch.int32)
+    logits_ptr = TritonWarmupTensor(torch.float32, shape=(num_rows, columns))
+    compiled = []
+    for tile_r, block_n, num_warps in candidates:
+        try:
+            _qsa_mqa_paged_prefill_kernel.warmup(
+                q_ptr,
+                k_cache_ptr,
+                page_table_ptr,
+                query_start_loc_ptr,
+                visible_blocks_ptr,
+                logits_ptr,
+                num_heads * head_dim,
+                head_dim,
+                k_cache.stride(0),
+                k_cache.stride(1),
+                page_table.stride(0),
+                columns,
+                num_rows,
+                0,
+                page_table_width,
+                PAGE_SIZE=page_size,
+                NUM_HEADS=num_heads,
+                HEAD_DIM=head_dim,
+                TILE_R=tile_r,
+                BLOCK_N=block_n,
+                K_TILES=16,
+                STAGES=2,
+                num_warps=num_warps,
+                grid=(1, 1, 1),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Turing autotune candidate %s skipped at warmup: %s",
+                _describe_prefill((tile_r, block_n, num_warps)),
+                str(exc).splitlines()[0][:120] if str(exc) else type(exc),
+            )
+            continue
+        compiled.append((tile_r, block_n, num_warps))
+    return tuple(compiled)
 
 
 def expand_qsa_block_indices(
@@ -534,10 +759,12 @@ def qsa_select_paged_decode(
 
     columns = page_table.shape[1] * k_cache.shape[1]
     logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
-    tiles_per_program = _decode_tiles_per_program(num_requests, columns)
+    block_n, tiles_per_program, num_warps = _decode_profile(
+        num_requests, columns, k_cache.dtype
+    )
     grid = (
         num_requests,
-        triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
+        triton.cdiv(columns, block_n * tiles_per_program),
     )
     _qsa_mqa_paged_uniform_kernel[grid](
         q,
@@ -554,11 +781,10 @@ def qsa_select_paged_decode(
         NUM_HEADS=q.shape[1],
         HEAD_DIM=q.shape[2],
         DECODE_QUERY_LEN=decode_query_len,
-        BLOCK_N=_DECODE_BLOCK_N,
+        BLOCK_N=block_n,
         TILES_PER_PROG=tiles_per_program,
         STAGES=2,
-        # tuned on GB300
-        num_warps=1 if k_cache.dtype == torch.float8_e4m3fn else 2,
+        num_warps=num_warps,
     )
     _topk(
         logits,
@@ -645,4 +871,5 @@ __all__ = [
     "qsa_select_paged_decode",
     "qsa_select_paged_prefill",
     "warmup_qsa_mqa_paged_decode",
+    "warmup_qsa_mqa_paged_prefill_turing_candidates",
 ]
