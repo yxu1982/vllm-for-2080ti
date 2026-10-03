@@ -486,6 +486,81 @@ def warmup_qsa_mqa_paged_decode(
 _PERSISTENT_LOGITS: dict = {}
 
 
+
+def _indexer_cublas_enabled() -> bool:
+    return os.environ.get("VLLM_QWEN4_INDEXER_CUBLAS", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _prefill_logits_cublas(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    query_offset: int,
+    num_queries: int,
+    logits: torch.Tensor,
+    logits_width: int,
+) -> bool:
+    """Fill `logits` via dense cuBLAS scoring; return False to fall back.
+
+    Eligible only for the single-request fp16 prefill case (4 indexer heads,
+    head_dim 128). Gathers the request's pooled keys densely once, scores
+    with fp32 cuBLAS GEMM, applies ReLU + head-sum in torch, and masks
+    columns beyond each row's visible count. Numerically equivalent to the
+    Triton paged kernel up to GEMM accumulation order.
+    """
+    if q.dtype != torch.float16 or k_cache.dtype != torch.float16:
+        return False
+    if q.shape[1] != 4 or q.shape[2] != 128:
+        return False
+    if page_table.shape[0] != 1:
+        return False
+    if k_cache.ndim != 4 or k_cache.shape[2] != 1 or k_cache.shape[3] != 128:
+        return False
+    page_size = int(k_cache.shape[1])
+    if page_size <= 0:
+        return False
+    vis = visible_blocks[query_offset : query_offset + num_queries].to(torch.int64)
+    if int(vis.numel()) == 0:
+        return True
+    k_max = int(vis.max().item())
+    if k_max <= 0:
+        logits[:num_queries, :].zero_()
+        return True
+    k_max = min(k_max, logits_width)
+    # Only pay gather + GEMM launch when there is enough work; tiny chunks
+    # (decode, short prefill tails) stay on the Triton path.
+    _min_elems = int(
+        __import__("os").environ.get("VLLM_QWEN4_INDEXER_CUBLAS_MIN_ELEMENTS", "1048576")
+    )
+    if num_queries * k_max < _min_elems:
+        return False
+    # Gather first k_max pooled keys: logical key i -> page i//page_size,
+    # offset i%page_size, physical page_table[0, page].
+    pages_needed = min(
+        (k_max + page_size - 1) // page_size, int(page_table.shape[1])
+    )
+    if pages_needed * page_size < k_max:
+        return False
+    phys = page_table[0, :pages_needed].to(torch.int64)
+    idx = torch.arange(k_max, device=q.device)
+    blk = (idx // page_size).clamp_max(pages_needed - 1)
+    off = idx % page_size
+    keys_dense = k_cache[phys[blk], off][:, 0, :].contiguous().float()
+    q2 = q[query_offset : query_offset + num_queries].reshape(-1, 128).float()
+    scores = torch.mm(q2, keys_dense.t())
+    scores = scores.view(num_queries, 4, k_max)
+    scores = torch.relu(scores).sum(dim=1)
+    mask = torch.arange(k_max, device=q.device).unsqueeze(0) < vis.unsqueeze(1)
+    scores = torch.where(mask, scores, torch.zeros((), dtype=scores.dtype, device=scores.device))
+    logits[:num_queries, :k_max].copy_(scores)
+    if k_max < logits_width:
+        logits[:num_queries, k_max:logits_width].zero_()
+    return True
+
+
 def _prefill_logits(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -518,6 +593,17 @@ def _prefill_logits(
         logits = torch.empty(
             (num_queries, logits_width), dtype=torch.float32, device=q.device
         )
+    if _indexer_cublas_enabled() and _prefill_logits_cublas(
+        q,
+        k_cache,
+        page_table,
+        visible_blocks,
+        query_offset,
+        num_queries,
+        logits,
+        logits_width,
+    ):
+        return logits
     pre_ampere = not current_platform.has_device_capability(80)
     if pre_ampere:
         # Turing (sm75): 64 KiB smem/block. Measured on Quadro RTX 8000
