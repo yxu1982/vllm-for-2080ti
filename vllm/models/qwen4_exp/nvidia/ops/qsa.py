@@ -614,13 +614,17 @@ def _select_config(
     else:
         BLOCK_N, target_splits, num_warps = 64, 1, 2
     if _is_pre_ampere():
-        # Turing (sm75) has 64 KiB of shared memory per block. With
-        # HEAD_DIM=256 and num_stages=2 the 64- and 32-column K/V tiles do not
-        # fit (Triton OutOfResources at compile). A 16-column tile with four
-        # warps launches (1cat-vLLM #469 measured it on RTX 8000); fewer
-        # splits keep the merge kernel's BLOCK_SPLITS x HEAD_DIM fp32 reduce
-        # under Turing's 255-register budget.
-        BLOCK_N = 16
+        # Turing (sm75) has 64 KiB of shared memory per block. The 64-column
+        # K/V tile does not fit (Triton OutOfResources at compile), but the
+        # 32-column tile does at BLOCK_M=8 (40 KiB estimated, verified to
+        # compile and run on RTX 2080 Ti): offline bench over R=64..2048
+        # shows (BLOCK_N=32, warps=4) 1.4-1.9x faster than (16, 4) on the
+        # prefill path, while decode (R=1, graph-captured) stays fastest at
+        # (16, 4). use_prefill_config is capture-stable, so keying BLOCK_N
+        # on it keeps every capture path on a single config. Fewer splits
+        # keep the merge kernel's BLOCK_SPLITS x HEAD_DIM fp32 reduce under
+        # Turing's 255-register budget.
+        BLOCK_N = 32 if use_prefill_config else 16
         num_warps = 4
         target_splits = min(target_splits, 16)
     num_tiles = triton.cdiv(num_columns, BLOCK_N)
@@ -804,9 +808,14 @@ def qsa_sparse_paged_attention(
             group_size,
             num_splits,
         )
-        candidates = _turing_prefill_candidates(
-            block_m, head_dim, q.element_size(), fixed
-        )
+        # Pinned to the fixed profile (no sweep): the tuner key buckets
+        # rows but not per-row valid counts, so an early-chunk
+        # (small-visible) measurement picks BLOCK_N=16 and poisons the whole
+        # bucket, while full-visible steady shapes (R=64..2048, verified
+        # offline under both cold- and warm-L2) all run 1.4-1.9x faster on
+        # (32, 4). Re-enable the sweep only with a visible-occupancy-aware
+        # key. _turing_prefill_candidates stays for warmup pre-compilation.
+        candidates = [fixed]
         block_n, partial_warps = _TURING_PREFILL_TUNER.choose(
             key, candidates, fixed, _run, _describe_splitk,
             outputs=lambda: (out,),

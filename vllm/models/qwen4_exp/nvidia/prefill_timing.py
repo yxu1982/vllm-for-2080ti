@@ -119,6 +119,8 @@ def _report() -> None:
     qsa_attn = max(qsa_total - idx, 0.0)
     gdn = tot.get("gdn", 0.0)
     moe = tot.get("moe", 0.0)
+    ep = tot.get("moe_ep", 0.0)
+    moe_compute = max(moe - ep, 0.0)
     ple = tot.get("ple", 0.0)
     ar = tot.get("allreduce", 0.0)
     other = max(step - (qsa_total + gdn + moe + ple + ar), 0.0)
@@ -126,10 +128,10 @@ def _report() -> None:
     logger.info(
         "[prefill-timing] nt=%d step=%.1fms | indexer=%.1f(%.0f%%) "
         "qsa_attn=%.1f(%.0f%%) | gdn=%.1f(%.0f%%) "
-        "moe=%.1f(%.0f%%)(incl EP a2a) ple=%.1f(%.0f%%) "
+        "moe=%.1f(%.0f%%)(compute %.1f ep %.1f) ple=%.1f(%.0f%%) "
         "allreduce=%.1f(%.0f%%) other=%.1f(%.0f%%)",
         _state["num_tokens"], step, idx, pc(idx), qsa_attn, pc(qsa_attn),
-        gdn, pc(gdn), moe, pc(moe), ple, pc(ple), ar, pc(ar), other, pc(other),
+        gdn, pc(gdn), moe, pc(moe), moe_compute, ep, ple, pc(ple), ar, pc(ar), other, pc(other),
     )
 
 
@@ -162,6 +164,49 @@ def _patch_allreduce() -> None:
     CudaCommunicator.all_reduce = timed_all_reduce
 
 
+def _patch_moe_ep() -> None:
+    """Wrap EP dispatch/combine (AgRs allgather/reduce-scatter) separately.
+
+    On pre-NVLink boxes the EP manager is AgRsAll2AllManager: dispatch =
+    all_gatherv, combine = reduce_scatterv. moe_compute = moe module time
+    minus this bucket (serial data dependency, no overlap expected).
+    """
+    try:
+        from vllm.distributed.device_communicators.all2all import (
+            AgRsAll2AllManager,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.info("[prefill-timing] cannot patch moe_ep: %s", e)
+        return
+    if getattr(AgRsAll2AllManager.dispatch, "_prefill_timed", False):
+        return
+    orig_d = AgRsAll2AllManager.dispatch
+    orig_c = AgRsAll2AllManager.combine
+
+    def timed_ep(self, orig, *args, **kwargs):
+        if not _ENABLED or _capturing():
+            return orig(self, *args, **kwargs)
+        s = torch.cuda.Event(enable_timing=True)
+        s.record()
+        try:
+            return orig(self, *args, **kwargs)
+        finally:
+            e = torch.cuda.Event(enable_timing=True)
+            e.record()
+            _events.setdefault("moe_ep", []).append((s, e))
+
+    def timed_dispatch(self, *args, **kwargs):
+        return timed_ep(self, orig_d, *args, **kwargs)
+
+    def timed_combine(self, *args, **kwargs):
+        return timed_ep(self, orig_c, *args, **kwargs)
+
+    timed_dispatch._prefill_timed = True  # type: ignore[attr-defined]
+    timed_combine._prefill_timed = True  # type: ignore[attr-defined]
+    AgRsAll2AllManager.dispatch = timed_dispatch
+    AgRsAll2AllManager.combine = timed_combine
+
+
 if _ENABLED:
     from torch.nn.modules.module import (
         register_module_forward_hook,
@@ -171,4 +216,5 @@ if _ENABLED:
     register_module_forward_pre_hook(_gpre)
     register_module_forward_hook(_gpost)
     _patch_allreduce()
+    _patch_moe_ep()
     logger.info("[prefill-timing] enabled (VLLM_QWEN4_PREFILL_TIMING=1)")

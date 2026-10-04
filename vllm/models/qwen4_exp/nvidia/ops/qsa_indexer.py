@@ -483,7 +483,75 @@ def warmup_qsa_mqa_paged_decode(
     return profiles
 
 
+# Dense cuBLAS indexer scoring (SM75-tuned port of the 1cat SM70 path):
+# fp16 inputs with fp32 accumulation (Tensor Core HMMA; the q/k inputs are
+# already fp16 so no precision is lost vs an fp32 upcast), one fused
+# ReLU+headsum+mask epilogue per tile (instead of three torch passes), and
+# column tiling to bound transient memory on long contexts.
+_INDEXER_CUBLAS_TILE_BYTES = (
+    int(os.environ.get("VLLM_QWEN4_INDEXER_CUBLAS_TILE_MB", "64")) * 1024 * 1024
+)
+_INDEXER_CUBLAS_EPILOGUE_BN = int(
+    os.environ.get("VLLM_QWEN4_INDEXER_CUBLAS_EPILOGUE_BN", "256")
+)
+
+
+@triton.jit
+def _qsa_cublas_epilogue_kernel(
+    score_ptr,
+    visible_ptr,
+    logits_ptr,
+    stride_score_row,
+    stride_score_col,
+    stride_logits_row,
+    stride_logits_col,
+    width,
+    col0,
+    NUM_HEADS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Fused ReLU + head-sum + visible-mask for one cuBLAS score tile.
+
+    scores is (rows*NUM_HEADS, tile_width) fp32; writes one fp32 logit per
+    (row, absolute column). Dead columns get -inf (never selected by top-k;
+    strictly safer than 0.0, which ties with genuine zero-score blocks).
+    No score rescaling: the downstream top-k only consumes the ranking, and
+    the divisor (sqrt(head_dim) > 0) is ranking-invariant.
+    """
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    abs_cols = col0 + cols
+    vis = tl.load(visible_ptr + row)
+    live = (cols < width) & (abs_cols < vis)
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for h in range(NUM_HEADS):
+        v = tl.load(
+            score_ptr
+            + (row * NUM_HEADS + h) * stride_score_row
+            + cols * stride_score_col,
+            mask=cols < width,
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.maximum(v, 0.0)
+    tl.store(
+        logits_ptr + row * stride_logits_row + abs_cols * stride_logits_col,
+        tl.where(live, acc, -float("inf")),
+        mask=cols < width,
+    )
+
+
 _PERSISTENT_LOGITS: dict = {}
+
+
+_TOPK_WORKSPACE: dict = {}
+
+
+def _topk_workspace(device):
+    buf = _TOPK_WORKSPACE.get(device)
+    if buf is None or buf.numel() < _TOPK_WORKSPACE_BYTES:
+        buf = torch.empty((_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=device)
+        _TOPK_WORKSPACE[device] = buf
+    return buf
 
 
 
@@ -491,6 +559,24 @@ def _indexer_cublas_enabled() -> bool:
     return os.environ.get("VLLM_QWEN4_INDEXER_CUBLAS", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
+
+
+@triton.jit
+def _qsa_gather_map_kernel(
+    page_table_ptr,
+    blk_ptr,
+    off_ptr,
+    pages_needed,
+    page_size,
+    k_max,
+    BLOCK: tl.constexpr,
+):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = i < k_max
+    pg = tl.minimum(i // page_size, pages_needed - 1)
+    phys = tl.load(page_table_ptr + pg, mask=m, other=0).to(tl.int64)
+    tl.store(blk_ptr + i, phys, mask=m)
+    tl.store(off_ptr + i, (i % page_size).to(tl.int64), mask=m)
 
 
 def _prefill_logits_cublas(
@@ -522,7 +608,19 @@ def _prefill_logits_cublas(
     page_size = int(k_cache.shape[1])
     if page_size <= 0:
         return False
+    # Only pay gather + GEMM launch when there is enough work; tiny chunks
+    # (decode, short prefill tails) stay on the Triton path.
+    _min_elems = int(
+        __import__("os").environ.get("VLLM_QWEN4_INDEXER_CUBLAS_MIN_ELEMENTS", "1048576")
+    )
+    # Stage 1 (no D2H): the full width bounds k_max from above; if even that
+    # is too small, return before paying the visible-max sync or the int64
+    # slice copy below.
+    if num_queries * logits_width < _min_elems:
+        return False
     vis = visible_blocks[query_offset : query_offset + num_queries].to(torch.int64)
+    # Stage 2: exact visible max costs one D2H sync; only reached when the
+    # dense path is plausible.
     if int(vis.numel()) == 0:
         return True
     k_max = int(vis.max().item())
@@ -530,11 +628,6 @@ def _prefill_logits_cublas(
         logits[:num_queries, :].zero_()
         return True
     k_max = min(k_max, logits_width)
-    # Only pay gather + GEMM launch when there is enough work; tiny chunks
-    # (decode, short prefill tails) stay on the Triton path.
-    _min_elems = int(
-        __import__("os").environ.get("VLLM_QWEN4_INDEXER_CUBLAS_MIN_ELEMENTS", "1048576")
-    )
     if num_queries * k_max < _min_elems:
         return False
     # Gather first k_max pooled keys: logical key i -> page i//page_size,
@@ -544,18 +637,42 @@ def _prefill_logits_cublas(
     )
     if pages_needed * page_size < k_max:
         return False
-    phys = page_table[0, :pages_needed].to(torch.int64)
-    idx = torch.arange(k_max, device=q.device)
-    blk = (idx // page_size).clamp_max(pages_needed - 1)
-    off = idx % page_size
-    keys_dense = k_cache[phys[blk], off][:, 0, :].contiguous().float()
-    q2 = q[query_offset : query_offset + num_queries].reshape(-1, 128).float()
-    scores = torch.mm(q2, keys_dense.t())
-    scores = scores.view(num_queries, 4, k_max)
-    scores = torch.relu(scores).sum(dim=1)
-    mask = torch.arange(k_max, device=q.device).unsqueeze(0) < vis.unsqueeze(1)
-    scores = torch.where(mask, scores, torch.zeros((), dtype=scores.dtype, device=scores.device))
-    logits[:num_queries, :k_max].copy_(scores)
+    # Fused logical->physical map (single pass replacing the arange +
+    # div + mod + clamp + int64-copy launch sequence). Single-request only
+    # (gated above), so row 0 of the table is the only row.
+    blk = torch.empty((k_max,), dtype=torch.int64, device=q.device)
+    off = torch.empty((k_max,), dtype=torch.int64, device=q.device)
+    _qsa_gather_map_kernel[(triton.cdiv(k_max, 1024),)](
+        page_table, blk, off, pages_needed, page_size, k_max, BLOCK=1024
+    )
+    # fp16 in / fp32 out: cuBLAS HMMA with fp32 accumulation. The q/k
+    # inputs are already fp16, so skipping the fp32 upcast loses nothing and
+    # roughly doubles GEMM throughput on SM75 Tensor Cores.
+    keys_dense = k_cache[blk, off][:, 0, :].contiguous()
+    q2 = q[query_offset : query_offset + num_queries].reshape(-1, 128)
+    rows4 = q2.shape[0]  # num_queries * 4 indexer heads
+    bytes_per_col = max(1, rows4 * torch.float32.itemsize)
+    tile_cols = max(256, min(k_max, _INDEXER_CUBLAS_TILE_BYTES // bytes_per_col))
+    tile_cols = max(256, tile_cols // 256 * 256)
+    bn = _INDEXER_CUBLAS_EPILOGUE_BN
+    for col0 in range(0, k_max, tile_cols):
+        col1 = min(col0 + tile_cols, k_max)
+        scores = torch.mm(
+            q2, keys_dense[col0:col1].t(), out_dtype=torch.float32
+        )
+        _qsa_cublas_epilogue_kernel[(num_queries, triton.cdiv(col1 - col0, bn))](
+            scores,
+            vis,
+            logits,
+            scores.stride(0),
+            scores.stride(1),
+            logits.stride(0),
+            logits.stride(1),
+            col1 - col0,
+            col0,
+            NUM_HEADS=4,
+            BLOCK_N=bn,
+        )
     if k_max < logits_width:
         logits[:num_queries, k_max:logits_width].zero_()
     return True
@@ -577,7 +694,10 @@ def _prefill_logits(
     assert 0 <= query_offset <= query_offset + num_queries <= q.shape[0]
     assert 0 < logits_width <= page_table.shape[1] * k_cache.shape[1]
 
-    if os.environ.get("VLLM_QWEN4_INDEXER_PERSISTENT_LOGITS"):
+    if (
+        os.environ.get("VLLM_QWEN4_INDEXER_PERSISTENT_LOGITS", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ):
         # One persistent fp32 buffer per device, grown to the largest shape
         # seen (bounded by VLLM_SPARSE_INDEXER_MAX_LOGITS_MB): the per-call
         # torch.empty at a context-dependent width left the caching allocator
@@ -878,7 +998,7 @@ def qsa_select_paged_decode(
         token_topk,
         compress_ratio,
         block_indices,
-        torch.empty((_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device),
+        _topk_workspace(q.device),
     )
 
 
@@ -924,9 +1044,7 @@ def qsa_select_paged_prefill(
     # chunk the inputs to keep temp logits below VLLM_SPARSE_INDEXER_MAX_LOGITS_MB
     max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
     rows_per_chunk = max(1, max_logits_bytes // (logits_width * 4))
-    topk_workspace = torch.empty(
-        (_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device
-    )
+    topk_workspace = _topk_workspace(q.device)
 
     for query_start in range(0, rows, rows_per_chunk):
         query_end = min(query_start + rows_per_chunk, rows)
