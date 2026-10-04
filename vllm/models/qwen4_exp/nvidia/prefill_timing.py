@@ -28,6 +28,9 @@ _TARGETS = {
     "QSAIndexer": "qsa_indexer",
     "QwenGatedDeltaNetAttention": "gdn",
     "Qwen4ExpSparseMoeBlock": "moe",
+    "GateLinear": "moe_gate",
+    "SharedExperts": "moe_shared",
+    "Qwen3NextMLP": "moe_shared_mlp",
     "Qwen4ExpPLELayer": "ple",
 }
 _ROOT_NAMES = ("Qwen4ExpModel",)
@@ -121,6 +124,14 @@ def _report() -> None:
     moe = tot.get("moe", 0.0)
     ep = tot.get("moe_ep", 0.0)
     moe_compute = max(moe - ep, 0.0)
+    gate = tot.get("moe_gate", 0.0)
+    align = tot.get("moe_align", 0.0)
+    marlin = tot.get("moe_marlin", 0.0)
+    shared = tot.get("moe_shared", 0.0)
+    shared_mlp = tot.get("moe_shared_mlp", 0.0)
+    select = tot.get("moe_select", 0.0)
+    modular = tot.get("moe_modular", 0.0)
+    monolithic = tot.get("moe_monolithic", 0.0)
     ple = tot.get("ple", 0.0)
     ar = tot.get("allreduce", 0.0)
     other = max(step - (qsa_total + gdn + moe + ple + ar), 0.0)
@@ -128,10 +139,10 @@ def _report() -> None:
     logger.info(
         "[prefill-timing] nt=%d step=%.1fms | indexer=%.1f(%.0f%%) "
         "qsa_attn=%.1f(%.0f%%) | gdn=%.1f(%.0f%%) "
-        "moe=%.1f(%.0f%%)(compute %.1f ep %.1f) ple=%.1f(%.0f%%) "
+        "moe=%.1f(%.0f%%)(compute %.1f ep %.1f gate %.1f align %.1f marlin %.1f shared %.1f(+mlp %.1f) select %.1f modular %.1f monolithic %.1f) ple=%.1f(%.0f%%) "
         "allreduce=%.1f(%.0f%%) other=%.1f(%.0f%%)",
         _state["num_tokens"], step, idx, pc(idx), qsa_attn, pc(qsa_attn),
-        gdn, pc(gdn), moe, pc(moe), moe_compute, ep, ple, pc(ple), ar, pc(ar), other, pc(other),
+        gdn, pc(gdn), moe, pc(moe), moe_compute, ep, gate, align, marlin, shared, shared_mlp, select, modular, monolithic, ple, pc(ple), ar, pc(ar), other, pc(other),
     )
 
 
@@ -162,6 +173,70 @@ def _patch_allreduce() -> None:
 
     timed_all_reduce._prefill_timed = True  # type: ignore[attr-defined]
     CudaCommunicator.all_reduce = timed_all_reduce
+
+
+def _timed_fn(orig, label):
+    """Wrap a plain function with CUDA-event timing into ``label``."""
+
+    def wrapper(*args, **kwargs):
+        if not _ENABLED or _capturing():
+            return orig(*args, **kwargs)
+        s = torch.cuda.Event(enable_timing=True)
+        s.record()
+        try:
+            return orig(*args, **kwargs)
+        finally:
+            e = torch.cuda.Event(enable_timing=True)
+            e.record()
+            _events.setdefault(label, []).append((s, e))
+
+    wrapper._prefill_timed = True  # type: ignore[attr-defined]
+    return wrapper
+
+
+def _patch_moe_fns() -> None:
+    """Time MoE compute pieces: align kernel and Marlin grouped GEMMs."""
+    try:
+        from vllm.model_executor.layers.fused_moe.experts import marlin_moe
+    except Exception as e:  # noqa: BLE001
+        logger.info("[prefill-timing] cannot patch moe fns: %s", e)
+        return
+    if getattr(marlin_moe._fused_marlin_moe, "_prefill_timed", False):
+        return
+    marlin_moe._fused_marlin_moe = _timed_fn(
+        marlin_moe._fused_marlin_moe, "moe_marlin"
+    )
+    # NOTE: wrap the use-site reference (marlin_moe imported the name with
+    # `from ... import`); patching the source module alone would not fire.
+    try:
+        from vllm.model_executor.layers.fused_moe import routed_experts as _rexp
+        for _mname, _mlabel in (("forward_modular", "moe_modular"),
+                                ("forward_monolithic", "moe_monolithic")):
+            _m = getattr(_rexp.RoutedExperts, _mname, None)
+            if _m is not None and not getattr(_m, "_prefill_timed", False):
+                setattr(_rexp.RoutedExperts, _mname,
+                        _timed_fn(_m, _mlabel))
+    except (ImportError, AttributeError) as e:  # noqa: BLE001
+        logger.info("[prefill-timing] cannot patch routed experts: %s", e)
+    try:
+        from vllm.model_executor.layers.fused_moe.router import fused_moe_router as _fmr
+        if not getattr(_fmr.FusedMoERouter.select_experts, "_prefill_timed", False):
+            _fmr.FusedMoERouter.select_experts = _timed_fn(
+                _fmr.FusedMoERouter.select_experts, "moe_select"
+            )
+    except (ImportError, AttributeError) as e:  # noqa: BLE001
+        logger.info("[prefill-timing] cannot patch moe select: %s", e)
+    if getattr(marlin_moe.moe_align_block_size, "_prefill_timed", False):
+        return
+    marlin_moe.moe_align_block_size = _timed_fn(
+        marlin_moe.moe_align_block_size, "moe_align"
+    )
+    try:
+        marlin_moe.batched_moe_align_block_size = _timed_fn(
+            marlin_moe.batched_moe_align_block_size, "moe_align"
+        )
+    except AttributeError:
+        pass
 
 
 def _patch_moe_ep() -> None:
@@ -217,4 +292,5 @@ if _ENABLED:
     register_module_forward_hook(_gpost)
     _patch_allreduce()
     _patch_moe_ep()
+    _patch_moe_fns()
     logger.info("[prefill-timing] enabled (VLLM_QWEN4_PREFILL_TIMING=1)")
