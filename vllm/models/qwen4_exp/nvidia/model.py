@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen4Exp model."""
 
+import os
+
 from collections.abc import Iterable
 from itertools import islice
 
@@ -221,6 +223,17 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 layer_type == QSA_LAYER_TYPE
                 or getattr(config, "indexer_n_heads", None) is not None
             )
+            # Opt-out switch (default: QSA on): force dense attention on
+            # the QSA layers. Short-context only: dense over long context
+            # OOMs (quadratic scores) and is not quality-equivalent to the
+            # trained sparse selection.
+            if os.environ.get("VLLM_QWEN4_DISABLE_QSA", "0").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            ):
+                use_qsa = False
             if not use_qsa:
                 self.self_attn = Qwen3NextAttention(
                     config,
