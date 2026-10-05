@@ -105,7 +105,7 @@ def turing_autotune_enabled() -> bool:
     if _ENABLED is None:
         _ENABLED = bool(envs.VLLM_QWEN4_TURING_AUTOTUNE) and is_pre_ampere()
         if _ENABLED:
-            logger.info(
+            logger.debug(
                 "%s=1: Qwen4Exp Turing per-shape autotuning is ON "
                 "(prefill paths only; smem budget %d KiB).",
                 ENV_FLAG,
@@ -263,14 +263,16 @@ class ShapeTuner:
             best = fixed
         self.cache[key] = best
         elapsed = time.perf_counter() - t0
-        if _print_autotuning():
-            print(
-                f"Triton autotuning for function {self.name} finished after "
-                f"{elapsed:.2f}s; best config selected: {describe(best)};"
-            )
-            for candidate, ms in timings.items():
-                print(f"  {describe(candidate)}: {ms:.4f} ms")
-        logger.info(
+        logger.debug(
+            "Triton autotuning for function %s finished after %.2fs; "
+            "best config selected: %s;",
+            self.name,
+            elapsed,
+            describe(best),
+        )
+        for candidate, ms in timings.items():
+            logger.debug("  %s: %.4f ms", describe(candidate), ms)
+        logger.debug(
             "Turing autotune %s key=%s: selected %s (%.4f ms; fixed %s at "
             "%s ms; %d candidates in %.1fs)",
             self.name,
