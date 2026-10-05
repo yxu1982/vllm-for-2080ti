@@ -1063,8 +1063,19 @@ class Qwen4ExpForConditionalGeneration(
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        orig_to_new_substr = {"mtp.": None}
+        if os.environ.get("VLLM_QWEN4_DISABLE_QSA", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            # QSA disabled: the checkpoint's indexer weights have no target
+            # submodule in dense Qwen3NextAttention; drop them instead of
+            # failing strict loading (mirrors the "mtp.": None precedent).
+            orig_to_new_substr["self_attn.indexer"] = None
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
-            orig_to_new_substr={"mtp.": None},
+            orig_to_new_substr=orig_to_new_substr,
             orig_to_new_prefix={"visual.": None} if self.language_model_only else {},
         )
         loader = AutoWeightsLoader(
