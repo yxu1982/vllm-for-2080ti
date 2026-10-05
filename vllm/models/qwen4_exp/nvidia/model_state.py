@@ -69,6 +69,10 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+        # PLE host-gather: attach the prefetch hook (see vllm_ple_mmap).
+        import vllm.vllm_ple_mmap as _ple_mmap
+
+        _ple_mmap.attach_to_model_state(self, model)
 
     def _prepare_ngram_context(
         self,
@@ -112,10 +116,16 @@ class Qwen4ExpModelState(MambaHybridModelState):
         query_start_loc[: num_reqs_padded + 1].copy_(input_batch.query_start_loc)
         # Represent unused capacity as trailing zero-length requests.
         query_start_loc[num_reqs_padded + 1 :].copy_(input_batch.query_start_loc[-1])
+        ngram_context = self._prepare_ngram_context(input_batch, req_states)
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
+        # PLE host-gather: prefetch the resident buffer before forward
+        # (eager, outside capture).
+        _hg = getattr(self, "_ple_hg_layer", None)
+        if _hg is not None:
+            _hg.host_gather(input_batch.input_ids, query_start_loc, ngram_context)
         return model_inputs
 
     def prepare_dummy_inputs(
@@ -147,6 +157,14 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
+        # PLE host-gather: fill with zero ids for capture/profiling.
+        _hg = getattr(self, "_ple_hg_layer", None)
+        if _hg is not None:
+            _hg.host_gather(
+                self._ple_hg_dummy_ids[:num_tokens],
+                query_start_loc,
+                ngram_context,
+            )
         return model_inputs
 
 

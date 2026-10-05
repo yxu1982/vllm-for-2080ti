@@ -1140,6 +1140,13 @@ def maybe_apply(cls: type) -> None:
         self.ngram_embedding._zeros_dtype = self._ple_mmap_out_dtype
         self.layer_name = prefix
         _LAYER_BY_NAME[prefix] = self
+        # host-gather: move the gather into model_state.prepare_inputs
+        # (outside capture); forward just returns a view of the resident
+        # buffer -> no splitting op -> decode can use FULL cudagraph.
+        # The buffer is allocated at the end of load_weights (pre-capture).
+        self.prefetch_from_model_state = host_gather_enabled()
+        self._ple_hg_max_tokens = int(max_total_tokens)
+        self._ple_hg_buffer = None
         logger.info(
             "PLE mmap: %s -> placeholder embedding (%d rows x %d)",
             prefix,
@@ -1163,8 +1170,50 @@ def maybe_apply(cls: type) -> None:
             rest.append((name, w))
         loaded.update(orig_load_weights(self, rest))
         _setup_table(self)
-        _ensure_splitting_op()
+        if self.prefetch_from_model_state:
+            # host-gather: allocate the resident prefetch buffer
+            # (max_total_tokens rows) before capture -> fixed address,
+            # replay reads the same buffer. forward returns its view and
+            # never calls the custom op -> decode can be FULL-captured.
+            self._ple_hg_dtype = _ple_out_dtype(self)
+            self._ple_hg_buffer = torch.zeros(
+                (self._ple_hg_max_tokens, self.embedding_dim),
+                dtype=self._ple_hg_dtype,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+            logger.info(
+                "PLE mmap(host-gather): resident prefetch buffer %d x %d %s; "
+                "forward skips the custom op -> decode can use FULL graph",
+                self._ple_hg_max_tokens,
+                self.embedding_dim,
+                self._ple_hg_dtype,
+            )
+        else:
+            _ensure_splitting_op()
         return loaded
+
+    def host_gather(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        # Fill the resident buffer before forward (called by
+        # model_state.prepare_inputs). Runs eager (outside capture), so the
+        # D2H + host gather + H2D never enter the cudagraph.
+        buf = self._ple_hg_buffer
+        if buf is None:
+            return
+        input_ids = input_ids.reshape(-1)
+        num_tokens = min(input_ids.shape[0], buf.shape[0])
+        if num_tokens == 0:
+            return
+        ngram_ids = self.compute_ngram_ids(
+            input_ids[:num_tokens], query_start_loc, ngram_context
+        )
+        gathered = self.ngram_embedding(ngram_ids)
+        flat = gathered.reshape(num_tokens, -1).to(buf.dtype)
+        buf[:num_tokens].copy_(flat, non_blocking=True)
 
     def forward(
         self,
@@ -1173,9 +1222,21 @@ def maybe_apply(cls: type) -> None:
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
-        # Wrap compute_ngram_ids + host mmap gather + H2D in an out-of-graph
-        # custom op (registered as a Dynamo splitting op) so CUDA graph capture
-        # is not broken by the D2H/H2D copies.
+        del hidden_states
+        # host-gather mode: the gather already filled the resident buffer in
+        # model_state.prepare_inputs -> host_gather(); forward only returns a
+        # view of the first num_tokens rows (pure GPU op, no D2H/H2D/custom
+        # op -> safe to capture inside a FULL cudagraph).
+        if self.prefetch_from_model_state:
+            buf = self._ple_hg_buffer
+            if buf is None:
+                return torch.zeros(
+                    (input_ids.reshape(-1).shape[0], self.embedding_dim),
+                    dtype=self._ple_mmap_out_dtype,
+                    device=input_ids.device,
+                )
+            return buf[: input_ids.reshape(-1).shape[0]]
+        # fuse path (VLLM_PLE_HOST_GATHER=0): out-of-graph custom op.
         input_ids = input_ids.reshape(-1)
         num_tokens = input_ids.shape[0]
         output = torch.empty(
