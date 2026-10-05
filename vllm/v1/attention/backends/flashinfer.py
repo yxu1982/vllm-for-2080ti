@@ -508,12 +508,11 @@ class FlashInferBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        # FlashInfer supports SM75+, but is currently broken on SM75 (Turing):
-        # https://github.com/flashinfer-ai/flashinfer/issues/3620 (fix:
-        # https://github.com/flashinfer-ai/flashinfer/pull/3621). Temporarily
-        # raise the floor to SM80 so it is not auto-selected on SM75 until
-        # that fix lands; revert to DeviceCapability(7, 5) once it does.
-        return capability >= DeviceCapability(8, 0) and capability <= DeviceCapability(
+        # FlashInfer supports SM75+. The SM75 prefill shared-memory budget
+        # bug (flashinfer-ai/flashinfer#3620, fixed by #3621, verified on
+        # Tesla T4 end-to-end via vLLM) is fixed in flashinfer >= 0.6.18,
+        # so the floor stays at SM75.
+        return capability >= DeviceCapability(7, 5) and capability <= DeviceCapability(
             12, 1
         )
 
