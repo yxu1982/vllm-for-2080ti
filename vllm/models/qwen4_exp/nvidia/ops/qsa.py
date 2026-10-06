@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
 import torch
@@ -614,17 +615,20 @@ def _select_config(
     else:
         BLOCK_N, target_splits, num_warps = 64, 1, 2
     if _is_pre_ampere():
-        # Turing (sm75) has 64 KiB of shared memory per block. The 64-column
-        # K/V tile does not fit (Triton OutOfResources at compile), but the
-        # 32-column tile does at BLOCK_M=8 (40 KiB estimated, verified to
-        # compile and run on RTX 2080 Ti): offline bench over R=64..2048
-        # shows (BLOCK_N=32, warps=4) 1.4-1.9x faster than (16, 4) on the
-        # prefill path, while decode (R=1, graph-captured) stays fastest at
-        # (16, 4). use_prefill_config is capture-stable, so keying BLOCK_N
-        # on it keeps every capture path on a single config. Fewer splits
-        # keep the merge kernel's BLOCK_SPLITS x HEAD_DIM fp32 reduce under
-        # Turing's 255-register budget.
-        BLOCK_N = 32 if use_prefill_config else 16
+        # Turing (sm75) has 64 KiB of shared memory per block. On RTX 2080 Ti
+        # this kernel is SM/instruction-bound, not memory-bound: with
+        # BLOCK_M=16, HEAD_DIM=256 it runs at ~95% SM / ~30% DRAM / ~3% of
+        # tensor-core peak, and timings are unchanged for L2-resident vs DRAM
+        # K/V or sorted vs random indices. The 16-column tile (32 KiB smem,
+        # ~2 blocks/SM) beats the 32-column tile (~20-25% faster in isolation,
+        # ~9-12% e2e prefill at 25K-125K) purely by raising occupancy. Decode
+        # (R=1, graph-captured) also runs fastest at (16, 4). use_prefill_config
+        # is capture-stable, so keying BLOCK_N on it keeps every capture path on
+        # a single config. Fewer splits keep the merge kernel's
+        # BLOCK_SPLITS x HEAD_DIM fp32 reduce under Turing's 255-register
+        # budget. VLLM_QWEN4_QSA_PREFILL_BN overrides the prefill tile width.
+        BLOCK_N = (int(os.environ.get("VLLM_QWEN4_QSA_PREFILL_BN", "16"))
+                   if use_prefill_config else 16)
         num_warps = 4
         target_splits = min(target_splits, 16)
     num_tiles = triton.cdiv(num_columns, BLOCK_N)
