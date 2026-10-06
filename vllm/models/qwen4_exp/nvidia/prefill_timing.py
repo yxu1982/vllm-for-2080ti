@@ -34,7 +34,7 @@ _TARGETS = {
     "Qwen4ExpPLELayer": "ple",
 }
 _ROOT_NAMES = ("Qwen4ExpModel",)
-_REPORT_MIN_MS = 20.0
+_REPORT_MIN_MS = float(os.environ.get("VLLM_QWEN4_TIMING_MIN_MS", "20.0"))
 
 _events: dict[str, list] = {}
 _stack: dict[str, list] = {}
