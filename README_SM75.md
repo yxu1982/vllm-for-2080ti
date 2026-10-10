@@ -7,6 +7,15 @@
 - 目标拓扑：**TP2×PP4 + EP**（同 PCIe 岛内 TP，跨岛 PP）。
 - License：Apache-2.0（同上游）。
 
+## 测试环境
+
+- 主机：超微（Supermicro）**4028GR**
+- CPU：Intel Xeon **E5-2673 v4 ×2**
+- 内存：**128 GB**
+- GPU：**8× RTX 2080 Ti 22G（魔改）**，无 NVLink
+- 系统：**Ubuntu 24.04 LTS**
+- 驱动：**魔改驱动，开通 PCIe P2P**（GeForce 无 NVLink，靠 NVIDIA open 内核模块开 P2P；见"稳定性备忘"）
+
 ## 主要改动
 
 | 改动 | 文件 / 开关 | 说明 |
@@ -87,8 +96,6 @@ VLLM_PLE_MMAP_MODE=mem VLLM_PLE_MEM_LAZY=1 VLLM_DEFER_ENGRAM_LOAD=0 \
 - 功耗墙已压到 188W；温度正常（40~50°C）。
 
 ## 性能基线（AWQ，TP2PP4，8×2080Ti 22G）
-
-测试条件：8× RTX 2080 Ti 22G（魔改），无 NVLink，开通 PCIe P2P。
 
 - 25K prefill ≈ 4.7s，110K ≈ 18s；decode ≈ 51 tok/s；PPL ≈ 10.74。
 - QSA BN16：prefill −9%（25K）/ −12%（110K），精度中性。
