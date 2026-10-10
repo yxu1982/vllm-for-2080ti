@@ -61,6 +61,8 @@ VLLM_PLE_MMAP_MODE=mem VLLM_PLE_MEM_LAZY=1 VLLM_DEFER_ENGRAM_LOAD=0 \
 
 ## 性能基线（AWQ，TP2PP4，8×2080Ti 22G）
 
+测试条件：8× RTX 2080 Ti 22G（魔改），无 NVLink，开通 PCIe P2P。
+
 - 25K prefill ≈ 4.7s，110K ≈ 18s；decode ≈ 51 tok/s；PPL ≈ 10.74。
 - QSA BN16：prefill −9%（25K）/ −12%（110K），精度中性。
 - 精度：自建栈 + Flash-Next AWQ 与 ModelScope 官方 API 跑分基本持平（549 vs 549，6 项工具基准：ToolCall/InstructFollow/PromptAuthority/ReasonMath/BugFind/StructOutput）。
