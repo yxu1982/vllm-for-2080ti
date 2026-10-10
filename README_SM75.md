@@ -21,26 +21,28 @@
 ## 快速启动（AWQ，TP2PP4）
 
 ```bash
+# 前置：venv 的 vllm 在 PATH 中，且已清 /dev/shm 残留
 export PATH="/home/yxu/llm/venvs/vllm/bin:/usr/local/cuda/bin:$PATH"
-export VLLM_PLE_MMAP_MODE=mem VLLM_PLE_MEM_LAZY=1
-export VLLM_DEFER_ENGRAM_LOAD=0 VLLM_DROP_CHECKPOINT_CACHE=0
-export VLLM_PLE_HOST_GATHER=1 VLLM_USE_BREAKABLE_CUDAGRAPH=1
-export VLLM_QWEN4_TURING_AUTOTUNE=1 TRITON_PRINT_AUTOTUNING=0
-export VLLM_QWEN4_QSA_PREFILL_BN=16
-export VLLM_QWEN4_INDEXER_CUBLAS=0        # 1 更快，0 最稳
-export VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=64
-# export VLLM_TURING_GEMV=1               # 实验性，稳定性测试先别开
-export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-# export VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1  # TP4 才有收益
-rm -f /dev/shm/ple_mmap_* /dev/shm/psm_*  # 起服前清残留（host 125G，单表 95G）
+rm -f /dev/shm/ple_mmap_* /dev/shm/psm_*
 
-vllm serve <model> \
-  --tensor-parallel-size 2 --pipeline-parallel-size 4 --enable-expert-parallel \
-  --dtype float16 --gpu-memory-utilization 0.90 \
-  --max-num-batched-tokens 4096 \
-  --gdn-prefill-backend flashqla_sm75 \
-  --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
-  --trust-remote-code --host 0.0.0.0 --port 8000
+VLLM_PLE_MMAP_MODE=mem VLLM_PLE_MEM_LAZY=1 VLLM_DEFER_ENGRAM_LOAD=0 \
+        VLLM_DROP_CHECKPOINT_CACHE=0 VLLM_PLE_HOST_GATHER=1 \
+        VLLM_USE_BREAKABLE_CUDAGRAPH=1 VLLM_QWEN4_TURING_AUTOTUNE=1 \
+        TRITON_PRINT_AUTOTUNING=0 VLLM_QWEN4_QSA_PREFILL_BN=16 \
+        VLLM_QWEN4_INDEXER_CUBLAS=0 VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=64 \
+        VLLM_TURING_GEMV=1 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+        VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=0 \
+        CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+        vllm serve models/qwen3.8-flash-next-awq \
+        --tensor-parallel-size 2 --pipeline-parallel-size 4 --enable-expert-parallel \
+        --dtype float16 --kv-cache-dtype auto \
+        --gpu-memory-utilization 0.90 --max-model-len 524288 --max-num-seqs 4 --enable-prefix-caching \
+        --max-num-batched-tokens 4096 --trust-remote-code \
+        --gdn-prefill-backend flashqla_sm75 \
+        --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+        --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
+        --hf-overrides '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 2.0, "original_max_position_embeddings": 262144}}}' \
+        --port 32768 --host 0.0.0.0
 ```
 
 要点：
