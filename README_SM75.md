@@ -18,6 +18,33 @@
 | **AR 256 KiB 安全门（稳定性关键）** | `custom_all_reduce.py`（`VLLM_SM75_CUSTOM_AR_MAX_BYTES`，默认 262144）+ `flashinfer_pcie_ipc_all_reduce.py`（`VLLM_SM75_FI_PCIE_IPC_MAX_BYTES`） | custom AR / FlashInfer PCIe-IPC 单发超 256 KiB 会挂 GSP（Xid 119）；超限自动回退 NCCL，小包（decode）继续走高速路径 |
 | FlashInfer PCIe-IPC 回填 | 需配合 venv 中 flashinfer 0.7.0 回填；`VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1` | TP4 上 decode +17%、prefill 中性（TP2 走 custom AR/NCCL，此项无收益） |
 
+## 支持的量化格式（sm75，weight-only）
+
+Turing（sm75）**没有原生 FP8 / FP4 / BF16 计算单元**，所以本栈里所有量化格式都走 **weight-only**：
+权重按量化格式解码，**激活/累加用 fp16**（Tensor Core HMMA），dense 与 MoE 分别落到对应的 Marlin 内核。
+
+| checkpoint 格式 | `quantization` | sm75 后端 | 权重 / 激活 | 日志标志 |
+|---|---|---|---|---|
+| AWQ INT4（W4A16，group=32/128） | `awq` / `compressed-tensors`（pack-quantized） | `Marlin` WNA16 | 4bit / fp16 | `Using 'MARLIN' ... WNA16 MoE backend` |
+| AutoRound INT4（W4A16） | `compressed-tensors` | `Marlin` WNA16 | 4bit / fp16 | 同上 |
+| NVFP4（W4A16_NVFP4，modelopt） | `modelopt` / `compressed-tensors` | `Marlin` **NvFp4** | FP4 / fp16 | `Using 'MARLIN' NvFp4 MoE backend` |
+| FP8（blockwise，`weight_block_size=[128,128]`） | `fp8` | `MARLIN` Fp8（W8A16） | FP8 / fp16 | `Using MARLIN Fp8 MoE backend` + `marlin_utils_fp8.py:236 Weight-only FP8 ... leveraging the Marlin kernel` |
+
+统一要求：
+- **`--dtype float16`**：sm75 无 bf16 原生，checkpoint 里的 bf16 权重会被 cast（日志 `Casting torch.bfloat16 to torch.float16`）。
+- `--gdn-prefill-backend flashqla_sm75`、`--kv-cache-dtype auto`（或 `fp16`）。
+- FP8 额外：`--language-model-only`（省视觉路径）、`--max-num-seqs ≤ 93`（默认 256 会超可用 Mamba cache 块，见下）。
+
+### 回退到 fp16 运行的方式
+
+1. **自动回退（weight-only → fp16 计算）**：上面三种格式在 sm75 上都**自动**回退为"解码权重 + fp16 GEMM"，**无需开关**；启动日志出现 `Using 'MARLIN' ... MoE backend`（或 `Weight-only FP8 ... Marlin kernel`）即表示已走此路径。
+2. **手动跑全 fp16（未量化）**：量化路径不稳定、或想做精度上限对照时，用**未量化的 bf16 checkpoint** + `--dtype float16`，把权重 cast 成 fp16：
+   ```bash
+   vllm serve <bf16-model> --dtype float16   # 其余参数同下方快速启动
+   ```
+   注意：fp16 权重显存约为 INT4 的 ~4×，8×22G 可能放不下大模型；可配合 `--max-model-len` 缩小、`--gpu-memory-utilization` 调整，或 `--cpu-offload-gb N` 把部分权重放宿主内存。
+3. **与 AR 无关**：量化格式不影响集合通信；若遇到 GSP/MMU 崩溃，加 `--disable-custom-all-reduce`（保留 PCIe P2P，只换掉自旋式 custom AR）即可，量化格式照常。
+
 ## 快速启动（AWQ，TP2PP4）
 
 ```bash
