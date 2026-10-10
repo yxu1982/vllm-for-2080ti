@@ -101,6 +101,30 @@ VLLM_PLE_MMAP_MODE=mem VLLM_PLE_MEM_LAZY=1 VLLM_DEFER_ENGRAM_LOAD=0 \
 - QSA BN16：prefill −9%（25K）/ −12%（110K），精度中性。
 - 精度：自建栈 + Flash-Next AWQ 与 ModelScope 官方 API 跑分基本持平（549 vs 549，6 项工具基准：ToolCall/InstructFollow/PromptAuthority/ReasonMath/BugFind/StructOutput）。
 
+## 速度基准（Prefill / Decode）
+
+模型：Qwen3.8-Flash-Next AWQ + TP2/PP4/EP，**并发 1**，输出固定 128 tokens，上下文 50K–500K。
+
+| 提示长度 (tokens) | Prefill (tokens/s) | Decode (tokens/s) |
+|---|---|---|
+| 50,000 | 5868.68 | 45.22 |
+| 100,000 | 6268.77 | 53.37 |
+| 150,000 | **6306.50** | 53.08 |
+| 200,000 | 6254.09 | 52.80 |
+| 250,000 | 6183.17 | 53.38 |
+| 300,000 | 6082.17 | 53.77 |
+| 350,000 | 5959.79 | 53.80 |
+| 400,000 | 5898.80 | 54.04 |
+| 450,000 | 5799.18 | 54.33 |
+| 500,000 | 5706.80 | **55.18** |
+
+- **Prefill**：平均 **6032.79 tok/s**（P50 6020.98 / P90 6272.54 / P95 6289.52），峰值 ~6306 @150K；满 500K 上下文约 **87.6s**。
+- **Decode**：平均 **52.90 tok/s**（P50 53.57 / P90 54.42 / P95 54.80）。
+
+![Prefill/Decode throughput table](docs/assets/llm_speedtest1.png)
+
+![Prefill/Decode throughput vs context length](docs/assets/llm_speedtest2.png)
+
 ## SQL 本地基准（Qwen3.8-Flash-Next AWQ）
 
 25 道 SQL 题（trivial / easy / medium / hard），跑 3 轮：
