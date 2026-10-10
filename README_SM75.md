@@ -99,7 +99,21 @@ VLLM_PLE_MMAP_MODE=mem VLLM_PLE_MEM_LAZY=1 VLLM_DEFER_ENGRAM_LOAD=0 \
 
 - 25K prefill ≈ 4.7s，110K ≈ 18s；decode ≈ 51 tok/s；PPL ≈ 10.74。
 - QSA BN16：prefill −9%（25K）/ −12%（110K），精度中性。
-- 精度：自建栈 + Flash-Next AWQ 与 ModelScope 官方 API 跑分基本持平（549 vs 549，6 项工具基准：ToolCall/InstructFollow/PromptAuthority/ReasonMath/BugFind/StructOutput）。
+- 精度：自建栈 + Flash-Next AWQ 与 ModelScope 官方 API 跑分基本持平（549 vs 549）。明细见下表。
+
+**精度对照（6 项工具基准，各 15 题）**
+
+| 任务 | Qwen3.8 27B+fp8 | Flash-Next + ModelScope AWQ | 魔改 vLLM + Flash-Next AWQ |
+|---|---|---|---|
+| ToolCall-15 | 100 | 100 | 100 |
+| InstructFollow-15 | 97 | 98 | 97 |
+| PromptAuthority-15 | 93 | 80 | 87 |
+| ReasonMath-15 | 80 | 82 | 77 |
+| BugFind-15 | 93 | 91 | 91 |
+| StructOutput-15 | 96 | 98 | 97 |
+| **总分** | **559** | **549** | **549** |
+
+> 注：第一列 `Qwen3.8 27B+fp8` 为**另一模型**，仅供参考，不与 Flash-Next 两列直接对比。
 
 ## 速度基准（Prefill / Decode）
 
