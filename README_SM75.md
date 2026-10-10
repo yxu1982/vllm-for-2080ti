@@ -48,15 +48,15 @@ Turing（sm75）**没有原生 FP8 / FP4 / BF16 计算单元**，所以本栈里
 
 1. **自动回退（weight-only → fp16 计算）**：上面三种格式在 sm75 上都**自动**回退为"解码权重 + fp16 GEMM"，**无需开关**；启动日志出现 `Using 'MARLIN' ... MoE backend`（或 `Weight-only FP8 ... Marlin kernel`）即表示已走此路径。
 2. **手动跑全 fp16（未量化）**：量化路径不稳定、或想做精度上限对照时，用**未量化的 bf16 checkpoint** + `--dtype float16`，把权重 cast 成 fp16：
-   bash
+   ```bash
    vllm serve <bf16-model> --dtype float16   # 其余参数同下方快速启动
-   
+   ```
    注意：fp16 权重显存约为 INT4 的 ~4×，8×22G 可能放不下大模型；可配合 `--max-model-len` 缩小、`--gpu-memory-utilization` 调整，或 `--cpu-offload-gb N` 把部分权重放宿主内存。
 3. **与 AR 无关**：量化格式不影响集合通信；若遇到 GSP/MMU 崩溃，加 `--disable-custom-all-reduce`（保留 PCIe P2P，只换掉自旋式 custom AR）即可，量化格式照常。
 
 ## 快速启动（AWQ，TP2PP4）
 
-bash
+```bash
 # 前置：venv 的 vllm 在 PATH 中，且已清 /dev/shm 残留
 export PATH="/home/yxu/llm/venvs/vllm/bin:/usr/local/cuda/bin:$PATH"
 rm -f /dev/shm/ple_mmap_* /dev/shm/psm_*
@@ -79,7 +79,7 @@ VLLM_PLE_MMAP_MODE=mem VLLM_PLE_MEM_LAZY=1 VLLM_DEFER_ENGRAM_LOAD=0 \
         --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
         --hf-overrides '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 2.0, "original_max_position_embeddings": 262144}}}' \
         --port 32768 --host 0.0.0.0
-
+```
 
 要点：
 - 起服前确认 8 卡显存为 0（残留 `VLLM::Worker` 会占卡，用 `pkill -9 -f 'VLLM::Worker'` 清）。
