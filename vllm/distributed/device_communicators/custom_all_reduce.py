@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import contextmanager
 from typing import cast
 
@@ -218,6 +219,36 @@ class CustomAllreduce:
                     CUSTOM_ALL_REDUCE_MAX_SIZES[device_capability_str][world_size],
                     max_size,
                 )
+        # SM75 stability: cap single-shot custom-AR at 256 KiB. Larger P2P
+        # blasts (>256 KiB) wedge GSP/MC on RTX 2080 Ti (Xid 119); oversized
+        # tensors are rejected in should_custom_ar() and fall back to NCCL.
+        # Env-overridable (set large to disable); only applies to sm75.
+        if current_platform.is_cuda() and device_capability is not None:
+            try:
+                _cap_ver = device_capability.as_version_str()
+            except AttributeError:
+                _cap_ver = f"{device_capability[0]}.{device_capability[1]}"
+            if _cap_ver == "7.5":
+                try:
+                    _sm75_cap = max(
+                        1,
+                        int(
+                            os.environ.get(
+                                "VLLM_SM75_CUSTOM_AR_MAX_BYTES",
+                                str(256 * 1024),
+                            )
+                        ),
+                    )
+                except ValueError:
+                    _sm75_cap = 256 * 1024
+                if max_size > _sm75_cap:
+                    logger.info(
+                        "SM75: capping custom allreduce max_size %d -> %d "
+                        "bytes (VLLM_SM75_CUSTOM_AR_MAX_BYTES)",
+                        max_size,
+                        _sm75_cap,
+                    )
+                    max_size = _sm75_cap
         # device.index is a visible ordinal, not a logical local ID.
         fully_connected = False
         if same_node:

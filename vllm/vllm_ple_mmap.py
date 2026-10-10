@@ -329,6 +329,8 @@ class MmapPleTable:
         # 写进共享页缓存, 各 rank 文件读必见, 仅 lazy 用)。
         self.lazy: bool = False
         self._tbl: str | None = None
+        self._full_ready: str | None = None
+        self._mem_full_cached = False
         self._done_flags: list[bool] | None = None
         self._fill_stop: threading.Event | None = None
         if mem:
@@ -342,6 +344,7 @@ class MmapPleTable:
             ready = f"{tbl}.ready"
             ready_full = f"{tbl}.ready.full"
             self._tbl = tbl
+            self._full_ready = ready_full
             # owner 选举: 对表文件 flock 非阻塞排他。拿到 = owner, 且必须终身
             # 持锁 (存到 self, 进程活多久锁多久; 内核在进程死亡时自动释放) ——
             # waiter 用同法试锁, 锁被占即证明 owner 活着。owner 崩 → 锁自动放 →
@@ -518,19 +521,52 @@ class MmapPleTable:
                 # lazy 下全程保留磁盘 memmap 视图: fill 线程读源 + gather miss 回退。
                 # (128 个 np.memmap 对象只是元数据, 无 RAM 成本, page cache 归内核管。)
 
+    def _mem_is_full(self) -> bool:
+        """整表是否已全量进内存 (一旦为 True 则单调保持, 缓存后零 syscall)。
+
+        - 非 lazy mem: 建表即全满。
+        - lazy-mem: owner 全填完写 `.ready.full` 标志; 热启动复用全满表时
+          __init__ 直接 attach (done 全 True)。存在该标志即全满, 此后 gather
+          可跳过水位文件读 + 按片分任务, 走单次内存索引。未满时每次 stat 一
+          次 (dentry 缓存, ~µs 级), 满后缓存不再 stat。
+        """
+        if self._mem_full_cached:
+            return True
+        if self.mem is None:
+            return False
+        if not self.lazy:
+            self._mem_full_cached = True
+            return True
+        if self._full_ready is not None and os.path.exists(self._full_ready):
+            self._mem_full_cached = True
+            return True
+        return False
+
     def gather(self, ids: np.ndarray) -> np.ndarray:
         """ids: int64 [N] 全局行号 -> uint8 [N, row_bytes] (新数组)。
 
-        三种路由:
-          - lazy-mem (self.lazy): 按片水位路由 —— 已填片 (si<k) 走内存 self.mem,
+        四种路由 (按成本从低到高):
+          - 小批量全内存快路 (decode: N<=64 且表全满): 跳过去重/排序/水位读/
+            按片分任务, 单次内存索引直接返回。
+          - 整表内存 (非 lazy, 或 lazy 已填满): 去重后单次花式索引, 跳过水位
+            文件读 + 按片分任务 + 线程池。
+          - lazy-mem 未填满: 按片水位路由 —— 已填片 (si<k) 走内存 self.mem,
             未填片 (si>=k) 走磁盘 self.mm miss 回退。两来源写同一 out 的不同区段,
             数据永远正确 (磁盘分片只读不可变, 水位只影响"从哪读"不影响内容)。
-          - 非 lazy mem (self.mem 非 None 且非 lazy): 整表连续数组单次花式索引。
           - disk: 按片分组对磁盘 memmap 花式索引 (page cache 换页)。
         """
         ids = np.ascontiguousarray(ids, dtype=np.int64).reshape(-1)
         if ids.size == 0:
             return np.empty((0, self.row_bytes), dtype=np.uint8)
+        # 先判一次全满 (未满时 1 次 stat, 满后缓存零成本), 后面复用不再读文件。
+        mem_full = self._mem_is_full()
+        if ids.size <= 64 and mem_full:
+            if ids.min() < 0 or ids.max() >= self.rows_total:
+                raise IndexError(
+                    f"PLE row id out of range: [{ids.min()}, {ids.max()}] "
+                    f"for {self.rows_total} rows"
+                )
+            return self.mem[ids]
         # 去重 + 排序: 重复 ngram 常见, 且排序行在片内局部性更好。
         uniq, inverse = np.unique(ids, return_inverse=True)
         if uniq[0] < 0 or uniq[-1] >= self.rows_total:
@@ -538,8 +574,8 @@ class MmapPleTable:
                 f"PLE row id out of range: [{uniq[0]}, {uniq[-1]}] "
                 f"for {self.rows_total} rows"
             )
-        # 非 lazy mem: 整表一个连续数组, 单次花式索引 (内存随机访问, 无 I/O)。
-        if self.mem is not None and not self.lazy:
+        # 整表一个连续数组, 单次花式索引 (内存随机访问, 无 I/O)。
+        if self.mem is not None and (not self.lazy or mem_full):
             return self.mem[uniq][inverse]
 
         shard = uniq // self.shard_size

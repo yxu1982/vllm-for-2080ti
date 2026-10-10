@@ -8,6 +8,7 @@ existing FlashInfer MNNVL/TRT-LLM all-reduce implementation, so it intentionally
 lives behind a separate wrapper and an opt-in environment variable.
 """
 
+import os
 from collections.abc import Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -28,6 +29,26 @@ logger = init_logger(__name__)
 
 _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
+
+# SM75 stability: validated safe single-shot cap. Larger P2P blasts
+# (>256 KiB) wedge GSP/MC on RTX 2080 Ti (Xid 119). Env-overridable;
+# oversized tensors are rejected in should_use() and fall back to NCCL.
+_FI_PCIE_IPC_SAFE_BYTES = 256 * 1024
+
+
+def _fi_pcie_ipc_cap_bytes() -> int:
+    try:
+        return max(
+            1,
+            int(
+                os.environ.get(
+                    "VLLM_SM75_FI_PCIE_IPC_MAX_BYTES",
+                    str(_FI_PCIE_IPC_SAFE_BYTES),
+                )
+            ),
+        )
+    except ValueError:
+        return _FI_PCIE_IPC_SAFE_BYTES
 
 try:
     import flashinfer.comm as flashinfer_comm
@@ -113,6 +134,14 @@ class FlashInferPcieIpcAllReduce:
             return
 
         batches = tuple(sorted({int(size) for size in capture_sizes if size > 0}))
+        # Only prepare batches within the safe cap, so tune()/prepare()
+        # never run large P2P blasts either.
+        _el = torch.tensor([], dtype=dtype).element_size()
+        batches = tuple(
+            b
+            for b in batches
+            if b * int(hidden_dim) * _el <= _fi_pcie_ipc_cap_bytes()
+        )
         if not batches:
             logger.warning_once(
                 "FlashInfer PCIe IPC all-reduce has no CUDA Graph capture sizes "
@@ -165,6 +194,7 @@ class FlashInferPcieIpcAllReduce:
             and inp.dim() == 2
             and inp.shape[1] == self.hidden_dim
             and inp.dtype == self.dtype
+            and inp.numel() * inp.element_size() <= _fi_pcie_ipc_cap_bytes()
             and workspace.supports(inp)
         )
 

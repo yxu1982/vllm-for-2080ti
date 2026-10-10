@@ -1794,3 +1794,15 @@ class RowParallelLinear(LinearBase):
         s += f", tp_size={self.tp_size}"
         s += f", reduce_results={self.reduce_results}"
         return s
+
+
+# --- VLLM_TURING_GEMV activation ---
+try:
+    import os as _os
+    if _os.environ.get("VLLM_TURING_GEMV", "0") == "1":
+        import vllm.turing_gemv as _turing_gemv
+        _turing_gemv.apply_patch()
+except Exception as _e:  # pragma: no cover
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "VLLM_TURING_GEMV activation failed: %s", _e)
