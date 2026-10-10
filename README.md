@@ -1,4 +1,9 @@
 <!-- markdownlint-disable MD001 MD041 -->
+
+> **SM75 / RTX 2080 Ti 分支**：本分支（`sm75-flashnext-awq`）把 vLLM 的 Qwen3.8-Flash-Next 适配到 8× RTX 2080 Ti 22G（Turing sm75，无 NVLink），含量化格式（AWQ INT4 / NVFP4 / FP8）支持、prefill/decode 优化，以及 custom-AR/GSP 崩溃修复。
+> 详细说明（改动清单、量化与 fp16 回退、启动命令、性能/精度基准、稳定性备忘）见 **[README_SM75.md](README_SM75.md)**。
+
+---
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
