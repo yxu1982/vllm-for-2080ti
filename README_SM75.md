@@ -91,7 +91,7 @@ VLLM_PLE_MMAP_MODE=mem VLLM_PLE_MEM_LAZY=1 VLLM_DEFER_ENGRAM_LOAD=0 \
 
 - 本机必须用 **NVIDIA open 内核模块**（GeForce 开 PCIe P2P 需要它），代价是 GSP 关不掉。
 - custom AR / FlashInfer PCIe-IPC / PLX two-stage 的**大包（>256 KiB）P2P 猛冲会挂 GSP（Xid 119，游走）**；NCCL 的 P2P 正常。本分支用 256 KiB 门限隔离。
-- 另见过 **Xid 32（MMU 非法访存）→ UVM fatal → 整机需 reboot**；与 custom AR 开启强相关，生产环境先用 NCCL。
+- 另见过 **Xid 32（MMU 非法访存）→ UVM fatal → 整机需 reboot**；**通过调低 `--gpu-memory-utilization` 已解决**（显存占用偏高时才会复现）。
 - 平台不支持 PCIe AER；`watch nvidia-smi` 这类高频全量 NVML 轮询会加剧 GSP 压力，服务时别开（要用就用 `--loop-ms` 单进程低频）。
 - GPU 功耗上限可按需设置（本速度测试为 250W；长时间稳定运行可酌情下调）；温度正常（40~50°C）。
 
