@@ -544,7 +544,7 @@ msgspec==0.21.1
     # via -r requirements/test/../common.txt
 mteb==2.8.3
     # via -r requirements/test/cuda.in
-multidict==6.1.0
+multidict==7.0.0
     # via
     #   aiohttp
     #   yarl
