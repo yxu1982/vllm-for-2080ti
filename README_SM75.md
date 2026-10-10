@@ -100,3 +100,19 @@ VLLM_PLE_MMAP_MODE=mem VLLM_PLE_MEM_LAZY=1 VLLM_DEFER_ENGRAM_LOAD=0 \
 - 25K prefill ≈ 4.7s，110K ≈ 18s；decode ≈ 51 tok/s；PPL ≈ 10.74。
 - QSA BN16：prefill −9%（25K）/ −12%（110K），精度中性。
 - 精度：自建栈 + Flash-Next AWQ 与 ModelScope 官方 API 跑分基本持平（549 vs 549，6 项工具基准：ToolCall/InstructFollow/PromptAuthority/ReasonMath/BugFind/StructOutput）。
+
+## SQL 本地基准（Qwen3.8-Flash-Next AWQ）
+
+25 道 SQL 题（trivial / easy / medium / hard），跑 3 轮：
+
+| 轮次 | 得分 | 耗时 |
+|---|---|---|
+| 第 1 轮 | 22/25 | 657s |
+| 第 2 轮 | 24/25 | 754s |
+| 第 3 轮 | 24/25 | 717s |
+| **合计** | **70/75 = 93.3%** | — |
+
+- trivial 10 题全对；错题集中在 **easy 的 Q1**、**hard 的 Q8 / Q10 / Q21**。
+- 每题 3 轮做对次数：Q1 = 1/3（不稳），Q8 / Q10 / Q21 各 = 2/3，其余全 3/3。
+
+![SQL LLM Local Benchmark](docs/assets/sql_llm_benchmark.png)
